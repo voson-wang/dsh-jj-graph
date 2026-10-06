@@ -1,0 +1,49 @@
+{
+  "name": "dsh-jj-graph",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH plugin: read-only Jujutsu (jj) repository graph for the DeepSeek Harness Web GUI — change graph, bookmark filtering, per-change diffs, working-copy panel",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "icon": "./icon.svg",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "jujutsu",
+    "jj",
+    "graph",
+    "visualization"
+  ],
+  "files": [
+    "index.js",
+    "client.js",
+    "web",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "client": {
+      "inject": [
+        "slots"
+      ],
+      "platform": "web"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

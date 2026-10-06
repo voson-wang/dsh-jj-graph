@@ -1,0 +1,18 @@
+# dsh-jj-graph bundle layer: mounts the plugin into the active profile.
+#
+# Host half: index.js  (registers read-only HTTP routes under /jj-graph)
+# Client half: client.js (served by dsh-client-modules under /plugins)
+#
+# Repository allow-list (optional): without `config`, the session workspace is
+# discovered automatically and any folder added through the page's "打开文件夹"
+# picker becomes readable for the rest of the process lifetime. To pin an
+# explicit list, uncomment and edit:
+#
+#   config:
+#     repo: "/Users/you/code/my-repo"
+#     # repos:
+#     #   - "/Users/you/code/repo-a"
+#     #   - "/Users/you/code/repo-b"
+- insert:
+    - id: jj-graph
+      name: dsh-jj-graph

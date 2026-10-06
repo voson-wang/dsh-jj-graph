@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "JJ Graph",
+    "description": "Read-only Jujutsu (jj) change graph: commits, bookmarks, per-change diffs and the working-copy panel."
+  }
+}
