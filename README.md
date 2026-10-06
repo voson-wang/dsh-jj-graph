@@ -70,11 +70,12 @@ GIT_GRAPH_CLIENT=~/.dsh/profiles/desktop/node_modules/dsh-git-graph/client.js no
 ## 本地验证
 
 ```sh
-# Host 半：43 项断言，含只读保证与仓库类型探测（自建 scratch 仓库，不碰你的仓库）
+# Host 半：51 项断言，含只读保证、仓库类型探测、参数注入拒绝、逐文件行完整性
+# （自建 scratch 仓库，不碰你的仓库）
 node test/ops.test.mjs
 
-# Client 半：12 项断言，钉住标签页的显示规则（桩容器，无需启动 Harness；
-# 带上 GIT_GRAPH_CLIENT 同时校验 git 插件时为 24 项）
+# Client 半：15 项断言，钉住标签页的显示规则与 fail-safe（桩容器，无需启动 Harness；
+# 带上 GIT_GRAPH_CLIENT 同时校验 git 插件时为 30 项）
 node test/client.test.mjs
 
 # 页面：DOM 复刻壳层 + 真实 handler，断言主题跟随 / 输入框隐藏 / 审批面板保留 /
@@ -95,6 +96,14 @@ node tools/verify-ui/check.mjs --repo <一个 jj 仓库>               # 自动�
 - **删除行只有 `--- a/<path>` 这一个来源**：`+++` 是 `/dev/null`，所以解析器把 a/ 侧先记成
   候选、由 `+++` 决定它是"文件本名"还是"重命名来源"；`oldPath` 只在 rename/copy 时非空，
   修改不再把自己的名字重复一遍，删除行也不会渲染成空路径。
+- **文件集合由 jj 说了算，patch 只供计数**：`jj diff --git` 是展示格式，二进制、空文件、
+  纯 mode 变更**根本没有** `---`/`+++` 行，靠它反推路径就会整条丢（v0.2.1 实测 5 个变更只
+  回 1 行）。现在行集合来自 diff 模板（`status`/`path`/`source.path()`，JSON 转义），
+  `--git` patch 只按路径挂 `+/-` 计数，因此文件名里有换行也不会漏行。
+- **HTTP 输入不进 jj 的全局参数位**：revision 一律绑成 `--revision=<v>` / `--revisions=<v>`，
+  路径一律写成 `file:"<path>"` 字面量。否则 `hash=--config-file=/outside.toml` 会被 jj 的
+  全局参数预解析吃掉、读到仓库外文件并在报错里回显其内容；`file=glob:a` 会被当成 fileset
+  模式（读到空 diff 或整个仓库）。
 - **书签 ≠ 分支**：`jj bookmark list --all-remotes` 还会列出 git 后端的合成远程 `git`，
   真远程另有其人——插件用 `jj git remote list` 的结果过滤，只保留真实远程。
 - **根提交**：jj 的 `root()`（全 0 commit id）不出现在图里，`total` 用 `(revset) ~ root()` 计数，
@@ -102,9 +111,14 @@ node tools/verify-ui/check.mjs --repo <一个 jj 仓库>               # 自动�
 - **绝对路径**：所有 jj 调用都 `cwd = 仓库根`，因为 jj 的 pathspec / `files()` 是相对**进程工作目录**
   而不是仓库根解析的。
 
-## 已知限制（v0.1）
+## 已知限制
 
 - 只读：改历史、建书签、推送都要回终端用 `jj`。
+- **只读的边界**：仓库不处于「并发 operation 分叉」时，插件不追加任何 operation（测试逐 op
+  断言）。但仓库一旦有多个 operation head（两个 jj 进程并发写过），**任何** jj 命令都会触发
+  jj 自身的 `reconcile divergent operations` 并新增一条 op —— 本插件的读也一样（隔离实测：
+  读一次图谱，heads 2→1、op 数 +1）。这是 jj 的自动修复行为，插件不额外写任何东西，但也因此
+  「读绝不改动仓库」这句话在分叉态下不成立。
 - 单仓库视图：一次只显示一个仓库（顶栏可切换）。
 - 智能显示只做到「按当前会话的工作区」：同一次会话里跨仓切换需要顶部「📂 打开」换仓库，tab 本身不跟着换。
 - 大仓库：`all()` 全量取；页面按 200 条分页，但 `total` 需要一次完整 revset 遍历（有 5 秒缓存）。

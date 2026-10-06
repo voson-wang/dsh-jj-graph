@@ -296,6 +296,48 @@ for (const target of TARGETS) {
     await settle()
     eq(c.live(VIEW).length, 0, 'a stale answer must not resurrect the tab')
   })
+
+  await check('probe: ok:true without a boolean jj keeps the tab (fail-safe)', async () => {
+    // `jj` missing or of the wrong type is *missing information*, not a "no":
+    // hiding on it would lose a tab the workspace deserves.
+    for (const reply of [{ ok: true }, { ok: true, jj: 'yes' }, { ok: true, jj: null }, { ok: true, jj: 1 }]) {
+      const c = scenario(target)
+      fetchImpl = () => Promise.resolve({ json: () => Promise.resolve(reply) })
+      await renderProbe(target, c, probeProps('/repos/whatever'))
+      eq(c.live(VIEW).length, 1, `view entries for reply ${JSON.stringify(reply)}`)
+    }
+  })
+
+  await check('probe: the tab is visible while a new workspace is still being probed (fail-safe)', async () => {
+    const hidden = WORKSPACES.find((ws) => !target.visibleWhen(ws.reply))
+    const c = scenario(target)
+    fetchImpl = () => Promise.resolve({ json: () => Promise.resolve(hidden.reply) })
+    await renderProbe(target, c, probeProps(hidden.path))
+    eq(c.live(VIEW).length, 0, 'after the hidden answer')
+    const resolvers = []
+    fetchImpl = () => new Promise((res) => { resolvers.push((reply) => res({ json: () => Promise.resolve(reply) })) })
+    await renderProbe(target, c, probeProps('/repos/next'))
+    eq(c.live(VIEW).length, 1, 'view entries while the new probe is in flight')
+    resolvers[0](hidden.reply)
+    await settle()
+    await settle()
+    eq(c.live(VIEW).length, 0, 'and the answer still applies once it lands')
+  })
+
+  await check('probe: losing the workspace mid-flight cannot hide the tab', async () => {
+    const hidden = WORKSPACES.find((ws) => !target.visibleWhen(ws.reply))
+    const c = scenario(target)
+    const resolvers = []
+    fetchImpl = () => new Promise((res) => { resolvers.push((reply) => res({ json: () => Promise.resolve(reply) })) })
+    await renderProbe(target, c, probeProps(hidden.path))   // in flight
+    await renderProbe(target, c, probeProps(undefined))     // session gone
+    eq(c.live(VIEW).length, 1, 'visible once the workspace is unknown')
+    eq(resolvers.length, 1, 'one probe was issued')
+    resolvers[0](hidden.reply)                              // the old answer lands late
+    await settle()
+    await settle()
+    eq(c.live(VIEW).length, 1, 'a stale answer for the lost workspace must not hide the tab')
+  })
 }
 
 /* ===================== summary ===================== */

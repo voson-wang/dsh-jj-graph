@@ -923,6 +923,7 @@ let COMMITS = [];          // [{hash, parents[], author, email, date, subject, r
 let BRANCHES = [];         // [{refname, kind, name, sha, head}]
 let WORKSTATUS = null;     // {branch, staged[], unstaged[], untracked[], counts}
 let wdDiffCache = new Map(); // workfile cache: "staged\0path" -> display text
+const WD_DIFF_CACHE_MAX = 24;
 function loadStored(key, def) {
   try {
     const v = localStorage.getItem(key);
@@ -932,8 +933,10 @@ function loadStored(key, def) {
 function saveStored(key, val) {
   try { localStorage.setItem(key, JSON.stringify(val)); } catch { /* ignore */ }
 }
-let WD_FOLDED = loadStored("jjg-wdfolded", false);      // whole panel collapsed
-const WD_GROUP_FOLDED = new Set(loadStored("jjg-wdgroupfolded", [])); // folded group keys
+let WD_FOLDED = loadStored("jjg-wdfolded", false) === true;      // whole panel collapsed
+// A stored value of the wrong shape (an object, a string) must not break boot:
+// `new Set({})` throws and would abort the whole module.
+const WD_GROUP_FOLDED = new Set(((v) => (Array.isArray(v) ? v : []))(loadStored("jjg-wdgroupfolded", []))); // folded group keys
 const WD_SELECT = new Set(); // "groupKey\0path" of checkbox-selected rows
 let SELECTED = null;
 let SEARCH = "";
@@ -1439,7 +1442,9 @@ function render() {
     b.addEventListener("click", async () => {
       b.disabled = true;
       b.textContent = "加载中…";
-      await loadMore();
+      // loadMore reports failure by returning without adding rows; either way the
+      // button has to come back, or one transient error ends pagination for good.
+      try { await loadMore(); } finally { b.disabled = false; b.textContent = `加载更多（已显示 ${LOADED} / ${TOTAL}）`; }
     });
     more.appendChild(b);
     list.appendChild(more);
@@ -1754,8 +1759,17 @@ function renderDetail(info, diff) {
       const m = line.match(/^\s*(.+?)\s*\|\s*(\d+)(.*)$/);
       if (m && !line.includes("files changed") && !line.includes("file changed") && !line.trim().startsWith("--")) {
         let fname = m[1].trim();
-        // rename "a => b" keeps the new name
-        if (fname.includes("=>")) fname = fname.split("=>")[1].trim();
+        // jj --stat renders a rename as "old => new", collapsing the shared parts
+        // into braces ("dir/{old => new}.js"). Keep the new name and rebuild the
+        // path around it -- taking everything after "=>" verbatim leaves a stray
+        // "}" and clicks a file that does not exist.
+        if (fname.includes("=>")) {
+          const at = fname.indexOf("=>");
+          const head = fname.slice(0, at).replace(/\{[^{}]*$/, "");
+          const tail = fname.slice(at + 2).replace(/^\s*/, "").replace(/\}/, "");
+          fname = (head + tail).replace(/\s+/g, " ").trim();
+        }
+        if (fname.startsWith("\"") && fname.endsWith("\"")) fname = fname.slice(1, -1);
         const fileSpan = document.createElement("span");
         fileSpan.className = "sf-file";
         fileSpan.textContent = fname;
@@ -1901,9 +1915,20 @@ async function showFileHist(file, rowEl) {
 /* ===================== workdir modal (VSCode-style) ===================== */
 /* ===================== workdir panel (persistent, top of the graph) ===================== */
 /** Fetch workstatus, then render the top panel + status line. */
+/** Render one already-fetched workstatus into panel + status line + stats. */
+function renderWorkstatus(ws) {
+  WORKSTATUS = ws;
+  renderWorkdir();
+  renderStatusLine();
+  renderStats();
+}
+
 async function refreshWorkdir() {
   const panel = $("wdPanel");
   panel.innerHTML = "";
+  // An explicit refresh means "re-read", so cached per-file diffs are stale by
+  // definition (the same path can hold new content).
+  wdDiffCache.clear();
   const loading = document.createElement("div");
   loading.className = "wd-clean";
   loading.textContent = "加载工作区状态…";
@@ -1911,10 +1936,7 @@ async function refreshWorkdir() {
   try {
     const ws = await api("workstatus");
     if (!ws.ok) { panel.innerHTML = ""; return; }
-    WORKSTATUS = ws;
-    renderWorkdir();
-    renderStatusLine();
-    renderStats();
+    renderWorkstatus(ws);
   } catch { /* ignore */ }
 }
 
@@ -2101,6 +2123,9 @@ async function loadWdFile(item, staged, pre) {
       isDiff = true;
       if (res.truncated) text = "（diff 过长已截断）\n" + text;
     }
+    // Bounded FIFO: one entry can approach 240k code units, and a long session
+    // walks many files.
+    if (wdDiffCache.size >= WD_DIFF_CACHE_MAX) wdDiffCache.delete(wdDiffCache.keys().next().value);
     wdDiffCache.set(key, { text, isDiff });
     renderWdText(pre, text, isDiff);
   } catch (err) {
@@ -2370,7 +2395,7 @@ async function load() {
     BRANCH_COLOR_CACHE = null;
     // 首次加载（尚无任何折叠偏好存储时）默认折叠全部分支组：
     // 只显示分组头，点击组头才展开该组提交；仅执行一次，之后尊重用户手动状态。
-    if (!BRANCH_FOLD_DEFAULTED && !localStorage.getItem("jjg-brfolded")) {
+    if (!BRANCH_FOLD_DEFAULTED && loadStored("jjg-brfolded", null) === null) {
       BRANCH_FOLD_DEFAULTED = true;
       for (const b of BRANCHES) {
         if (b.kind === "local" || b.kind === "remote") BRANCH_FOLDED.add(b.refname);
@@ -2778,7 +2803,10 @@ $("branchDlg").addEventListener("click", (ev) => { if (ev.target === $("branchDl
 async function openGithubCommit(hash) {
   const res = await api("remoteinfo");
   if (!res.ok || !res.web) { alert("未配置远程仓库（origin），无法打开远程变更页"); return; }
-  window.open(res.web + "/commit/" + hash, "_blank");
+  let url = null;
+  try { url = new URL(res.web + "/commit/" + hash); } catch { /* unusable URL */ }
+  if (url === null || (url.protocol !== "http:" && url.protocol !== "https:")) return;
+  window.open(url.href, "_blank", "noopener,noreferrer");
 }
 
 /* ---- shortcut panel (Ctrl+/) ---- */
@@ -2826,16 +2854,20 @@ async function autoRefreshTick() {
   if (!REPO) return;                      // empty state: no repo to poll (avoids 400 noise)
   AUTO_REFRESHING = true;
   try {
-    // Working tree changes (cheap).
+    // Working tree changes (cheap). `commitId` moves whenever jj rewrites the
+    // working-copy commit — including when the counts and bookmarks stay the
+    // same — so it is part of the change key along with the file list.
     const ws = await api("workstatus");
     if (ws.ok) {
-      const before = JSON.stringify(WORKSTATUS ? { branch: WORKSTATUS.branch, counts: WORKSTATUS.counts } : null);
-      const after = JSON.stringify({ branch: ws.branch, counts: ws.counts });
-      if (before !== after) {
+      const shape = (x) => JSON.stringify(x ? {
+        branch: x.branch,
+        commitId: x.commitId,
+        counts: x.counts,
+        files: (x.unstaged || []).map((f) => [f.code, f.path, f.added, f.deleted]),
+      } : null);
+      if (shape(WORKSTATUS) !== shape(ws)) {
         wdDiffCache.clear();
-        WORKSTATUS = ws;
-        refreshWorkdir();
-        renderStats();
+        renderWorkstatus(ws);
       }
     }
     // New commits / branch moves: compare the newest hash with what we have.

@@ -283,14 +283,24 @@ async function main() {
           // Only the scratch repo is seeded with this fixture; a caller-supplied
           // repo must never be written to, so this part is scratch-only.
           const byPath = new Map(files.map((f) => [f.path, f]))
-          if (!byPath.has('src/app.js') || byPath.get('src/app.js').code !== 'M') probs.push('scratch fixture src/app.js (modified) missing: ' + JSON.stringify(files.map((f) => f.path + ':' + f.code)))
-          if (!byPath.has('notes.txt') || byPath.get('notes.txt').code !== 'A') probs.push('scratch fixture notes.txt (added) missing')
-          // A deletion must carry its own path: `+++ /dev/null` cannot name it.
-          if (!byPath.has('src/util.js') || byPath.get('src/util.js').code !== 'D') probs.push('scratch fixture src/util.js (deleted) missing or unnamed: ' + JSON.stringify(files))
+          const FIXTURE = [
+            ['src/app.js', 'M'], ['notes.txt', 'A'], ['src/util.js', 'D'], ['tricky.txt', 'M'],
+            ['README.md', 'M'], ['bin.dat', 'A'], ['empty.txt', 'A'], ['glob:a', 'A'],
+          ]
+          for (const [name, code] of FIXTURE) {
+            if (!byPath.has(name)) probs.push(`scratch fixture ${name} (${code}) missing: ${JSON.stringify(files.map((f) => f.path + ':' + f.code))}`)
+            else if (byPath.get(name).code !== code) probs.push(`scratch fixture ${name} code=${byPath.get(name).code} != ${code}`)
+          }
+          // A mode-only change and a binary/empty add carry no `---`/`+++` at all.
+          if (byPath.get('bin.dat') && byPath.get('bin.dat').binary !== true) probs.push('bin.dat is not flagged binary')
+          // `--- old` / `+++ new` in the hunk body are content, not metadata.
+          const tricky = byPath.get('tricky.txt')
+          if (tricky && (tricky.added !== 1 || tricky.deleted !== 1)) probs.push(`tricky.txt counts ${tricky.added}/-${tricky.deleted}, expected +1/-1`)
           // Only a rename/copy may carry a distinct oldPath; a modify must not.
-          if (byPath.get('src/app.js') && byPath.get('src/app.js').oldPath) probs.push(`modified row carries oldPath=${JSON.stringify(byPath.get('src/app.js').oldPath)}`)
-          if (byPath.get('src/util.js') && byPath.get('src/util.js').oldPath) probs.push(`deleted row carries oldPath=${JSON.stringify(byPath.get('src/util.js').oldPath)}`)
-          if (r.json.counts && r.json.counts.unstaged !== 3) probs.push(`counts.unstaged=${r.json.counts.unstaged} (scratch fixture expects 3)`)
+          for (const name of ['src/app.js', 'src/util.js', 'tricky.txt']) {
+            if (byPath.get(name) && byPath.get(name).oldPath) probs.push(`${name} carries oldPath=${JSON.stringify(byPath.get(name).oldPath)}`)
+          }
+          if (r.json.counts && r.json.counts.unstaged !== FIXTURE.length) probs.push(`counts.unstaged=${r.json.counts.unstaged} (scratch fixture expects ${FIXTURE.length})`)
         }
         if (probs.length === 0) {
           const scope = server.repoGiven ? 'invariants only: --repo was supplied, no fixture written' : 'scratch fixture present'

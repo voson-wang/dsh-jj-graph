@@ -18,7 +18,7 @@
  */
 import { createServer } from 'node:http'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -76,6 +76,7 @@ function createScratchRepo(dir) {
   jj(null, ['git', 'init', dir])
   mkdirSync(join(dir, 'src'), { recursive: true })
   writeFileSync(join(dir, 'README.md'), '# jj verify scratch\n\nCreated by tools/verify-ui/serve.mjs.\n')
+  writeFileSync(join(dir, 'tricky.txt'), '-- old\n')
   jj(dir, ['commit', '-m', 'chore: initial scaffold'])
   writeFileSync(join(dir, 'src', 'app.js'), 'export const app = 1\n')
   jj(dir, ['commit', '-m', 'feat: add app entrypoint'])
@@ -89,6 +90,13 @@ function createScratchRepo(dir) {
   writeFileSync(join(dir, 'src', 'app.js'), 'export const app = 42\n')
   writeFileSync(join(dir, 'notes.txt'), 'scratch notes\n')
   rmSync(join(dir, 'src', 'util.js'))
+  // Shapes whose `jj diff --git` has no `---`/`+++` line to take a path from:
+  // a parser that hunts for those lines silently loses them.
+  writeFileSync(join(dir, 'tricky.txt'), '++ new\n')                     // hunk body starts with ---/+++
+  chmodSync(join(dir, 'README.md'), 0o755)                                // mode-only change
+  writeFileSync(join(dir, 'bin.dat'), Buffer.from([0, 1, 2, 0, 255, 3]))  // binary add
+  writeFileSync(join(dir, 'empty.txt'), '')                               // empty add
+  writeFileSync(join(dir, 'glob:a'), '')                                  // a name that parses as a fileset
 }
 
 const args = parseArgs(process.argv.slice(2))

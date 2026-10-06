@@ -92,33 +92,48 @@ window.__ModuleLoader__.load({
 			stop();
 		}
 
+		/** Fresh abort signal that also bounds engines without AbortSignal.timeout. */
+		function probeSignal() {
+			if (typeof AbortController !== "function") return { signal: undefined, done: () => {} };
+			const controller = new AbortController();
+			const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+			return { signal: controller.signal, done: () => clearTimeout(timer) };
+		}
+
 		/** Ask the Host what kind of repository `cwd` holds. */
 		function sync(cwd) {
 			if (typeof cwd !== "string" || cwd === "") {
-				// No workspace yet: never hide on missing information.
+				// No workspace yet: never hide on missing information. The sequence
+				// must advance too, or a late reply for the previous workspace would
+				// still pass the check below and hide the tab.
+				probeSeq += 1;
 				lastCwd = null;
 				applyVisibility(true);
 				return;
 			}
 			if (cwd === lastCwd) return;
 			lastCwd = cwd;
+			// Until this workspace answers, "missing information" is the whole
+			// state — so the tab stays visible while the probe is in flight.
+			applyVisibility(true);
 			const seq = ++probeSeq;
-			const signal = typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
-				? AbortSignal.timeout(PROBE_TIMEOUT_MS)
-				: undefined;
+			const { signal, done } = probeSignal();
 			fetch("/jj-graph/api?op=probe&ws=" + encodeURIComponent(cwd), signal === undefined ? undefined : { signal })
 				.then((res) => res.json())
 				.then((reply) => {
 					if (seq !== probeSeq) return; // a newer session already answered
-					if (reply === null || typeof reply !== "object" || reply.ok !== true) {
+					// Only a well-formed boolean may hide the tab: `{ok:true}` with a
+					// missing or non-boolean `jj` is missing information, not a "no".
+					if (reply === null || typeof reply !== "object" || reply.ok !== true || typeof reply.jj !== "boolean") {
 						applyVisibility(true);
 						return;
 					}
-					applyVisibility(reply.jj === true);
+					applyVisibility(reply.jj);
 				})
 				.catch(() => {
 					if (seq === probeSeq) applyVisibility(true);
-				});
+				})
+				.finally(done);
 		}
 
 		/** Invisible entry whose only job is to publish the shown session's cwd. */

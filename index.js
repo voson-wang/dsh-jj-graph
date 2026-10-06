@@ -21,6 +21,18 @@ const webRoot = join(here, 'web')
 
 const MAX_JJ_BUFFER = 32 * 1024 * 1024
 const MAX_DIFF_CHARS = 240000
+
+/**
+ * Cut `text` to `max` code units without leaving a lone surrogate behind.
+ * @returns the shortened text (the whole text when it already fits).
+ */
+function truncateText(text, max) {
+  if (text.length <= max) return text
+  const cut = text.slice(0, max)
+  const last = cut.charCodeAt(cut.length - 1)
+  // D83D alone renders as U+FFFD; dropping it loses one character, not two.
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut
+}
 const READ_TIMEOUT_MS = 30000
 const NET_TIMEOUT_MS = 120000
 
@@ -133,6 +145,17 @@ const SHOW_TEMPLATE = T([
 const BOOKMARK_TEMPLATE =
   T(['name', 'self.remote()', 'normal_target.commit_id()', 'if(normal_target, "1", "0")'])
 
+/**
+ * One row per changed file of a revision (jj evaluates this per TreeDiffEntry):
+ * status, path, and the rename/copy source. `source.path()` only exists for
+ * renames and copies, hence the guard.
+ */
+const DIFF_FILES_TEMPLATE = [
+  'json(status)',
+  'json(path)',
+  'json(if(status == "renamed" || status == "copied", source.path(), ""))',
+].join(' ++ "\\t" ++ ') + ' ++ "\\n"'
+
 const ROOT_COMMIT = /^0+$/
 
 /** Parse tab-joined JSONL produced by the templates above. */
@@ -204,6 +227,7 @@ function toCommits(stdout, wcCommitId) {
 function parseGitDiffFiles(text) {
   const files = []
   let cur = null
+  let inHunk = false
   const push = () => {
     if (cur === null) return
     // A deleted file only names itself on the `--- a/<path>` line: `+++` says
@@ -217,12 +241,28 @@ function parseGitDiffFiles(text) {
   for (const line of text.split('\n')) {
     if (line.startsWith('diff --git ')) {
       push()
+      // The header names both sides, so a file whose diff carries no `---`/`+++`
+      // at all (mode-only change, binary, empty file) still gets its path.
       // `minus` is the a/ side, remembered until `+++` says whether it is the
       // file's own name (modify/delete) or `/dev/null` (addition).
-      cur = { path: '', oldPath: '', minus: '', code: 'M', added: 0, deleted: 0, binary: false }
+      const m = /^diff --git a\/(.*) b\/(.*)$/.exec(line)
+      const from = m ? m[1] : ''
+      const to = m ? m[2] : ''
+      cur = { path: to, oldPath: from !== '' && from !== to ? from : '', minus: '', code: 'M', added: 0, deleted: 0, binary: false }
+      inHunk = false
       continue
     }
     if (cur === null) continue
+    if (inHunk) {
+      // Inside a hunk every line is content: `---`/`+++` here are ordinary
+      // added/removed lines, not metadata, and counting them as metadata both
+      // loses their line and stops the hunk early.
+      if (line.startsWith('@@')) continue
+      if (line.startsWith('+')) cur.added += 1
+      else if (line.startsWith('-')) cur.deleted += 1
+      continue
+    }
+    if (line.startsWith('@@')) { inHunk = true; continue }
     if (line.startsWith('new file mode')) cur.code = 'A'
     else if (line.startsWith('deleted file mode')) cur.code = 'D'
     else if (line.startsWith('rename from ')) {
@@ -245,19 +285,52 @@ function parseGitDiffFiles(text) {
       if (p !== '/dev/null' && !cur.minus) cur.minus = p.replace(/^a\//, '')
     } else if (line.startsWith('Binary files') || line.startsWith('GIT binary patch')) {
       cur.binary = true
-    } else if (line.startsWith('+') && !line.startsWith('+++')) {
-      cur.added += 1
-    } else if (line.startsWith('-') && !line.startsWith('---')) {
-      cur.deleted += 1
     }
   }
   push()
   return files
 }
 
+/**
+ * Bind one repo-relative path as a single literal file.
+ *
+ * A bare path argument is a fileset pattern: a file actually named `glob:a`
+ * would be read as a glob (and one named `-x` as an option). `file:"…"` is the
+ * literal form; jj's string literals escape like JSON.
+ */
+const literalFile = (p) => 'file:' + JSON.stringify(String(p))
+
+/**
+ * The changed files of one revision, straight from jj.
+ *
+ * The `--git` patch is a display format: files without hunks (binary, empty,
+ * mode-only) carry no path line at all, and a path containing a newline cannot
+ * be recovered from it. This template names every changed file with jj's own
+ * JSON escaping, so it is the authoritative row set; the patch only supplies the
+ * per-file line counts.
+ * @param rev - revision or revset.
+ * @returns [{code, path, oldPath}] with libgit-style codes.
+ */
+async function diffFilesOf(repo, rev) {
+  const out = await runJj(repo, readArgs(['diff', '--revision=' + rev, '-T', DIFF_FILES_TEMPLATE]))
+  const codes = { added: 'A', removed: 'D', modified: 'M', renamed: 'R', copied: 'C' }
+  return out
+    .split('\n')
+    .filter((l) => l !== '')
+    .map((line) => {
+      const [status, path, source] = line.split('\t').map((f) => JSON.parse(f))
+      return { code: codes[status] ?? 'M', path, oldPath: source || '' }
+    })
+}
+
 /* ===================== repo discovery ===================== */
 function normalizePath(p) {
-  return String(p ?? '').replace(/\\/g, '/').replace(/\/+$/, '')
+  const raw = String(p ?? '').replace(/\\/g, '/')
+  const stripped = raw.replace(/\/+$/, '')
+  if (stripped !== '') return /^[A-Za-z]:$/.test(stripped) ? stripped + '/' : stripped
+  // A filesystem root keeps its own name: stripping "/" to "" would render the
+  // picker's root as an unnamed path (`path: ""`), and "C:/" likewise.
+  return raw.includes('/') ? '/' : ''
 }
 
 function hasJj(dir) {
@@ -266,6 +339,31 @@ function hasJj(dir) {
   } catch {
     return false
   }
+}
+
+/**
+ * Walk up from `start` looking for `marker`, telling "absent" from "unknown".
+ *
+ * `ENOENT`/`ENOTDIR` mean the directory really has no marker. Any other error
+ * (EACCES, EIO, …) means the answer is unknown — and a probe that guessed "not a
+ * repository" from an unreadable directory would hide a tab that belongs there,
+ * the one failure this feature promises never to make.
+ * @returns the holding directory, or null when absent, or undefined when unknown.
+ */
+function findMarkerRoot(start, marker) {
+  let dir = normalizePath(start) || '/'
+  for (let i = 0; i < 32; i++) {
+    try {
+      if (statSync(join(dir, marker))) return dir
+    } catch (err) {
+      const code = err && err.code
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') return undefined
+    }
+    const parent = dirname(dir)
+    if (parent === dir) return null
+    dir = parent
+  }
+  return null
 }
 
 /** Walk up from `start` looking for a directory that holds a `.jj` entry. */
@@ -322,7 +420,10 @@ export function apply(ctx, config = {}) {
   }
   // `total` in the graph reply costs a full revset walk; memoize briefly so
   // pagination and the refresh button do not repeat it.
+  // Bounded: a 5 s TTL is still unbounded memory if every request carries a new
+  // revset, so entries are dropped once the map outgrows a small ceiling.
   const countCache = new Map()
+  const COUNT_CACHE_MAX = 64
 
   const countAll = async (repo, revset) => {
     const key = normKey(repo) + '\u0000' + revset
@@ -330,9 +431,14 @@ export function apply(ctx, config = {}) {
     if (hit !== undefined && Date.now() - hit.at < 5000) return hit.n
     // `log` drops jj's synthetic root commit; count the same set so the
     // pagination total matches the rows the graph will show.
-    const out = await runJj(repo, readArgs(['log', '-r', `(${revset}) ~ root()`, '--no-graph', '-T', '"." ++ "\\n"']))
+    const out = await runJj(repo, readArgs(['log', `--revisions=(${revset}) ~ root()`, '--no-graph', '-T', '"." ++ "\\n"']))
     const n = out.split('\n').filter((l) => l !== '').length
     countCache.set(key, { at: Date.now(), n })
+    if (countCache.size > COUNT_CACHE_MAX) {
+      const now = Date.now()
+      for (const [k, v] of countCache) if (now - v.at >= 5000) countCache.delete(k)
+      while (countCache.size > COUNT_CACHE_MAX) countCache.delete(countCache.keys().next().value)
+    }
     return n
   }
 
@@ -485,8 +591,13 @@ export function apply(ctx, config = {}) {
             sendJson({ ok: false, error: 'missing-ws' }, 400)
             return
           }
-          const jjRoot = findJjRoot(ws)
-          const gitRoot = findGitRoot(ws)
+          const jjRoot = findMarkerRoot(ws, '.jj')
+          const gitRoot = findMarkerRoot(ws, '.git')
+          if (jjRoot === undefined || gitRoot === undefined) {
+            // Unreadable workspace: "cannot tell", never "not a repository".
+            sendJson({ ok: false, error: 'unreadable-workspace', ws })
+            return
+          }
           sendJson({
             ok: true,
             ws,
@@ -629,7 +740,7 @@ export function apply(ctx, config = {}) {
             const skip = Math.max(0, Math.min(parseInt(url.searchParams.get('skip') || '0', 10) || 0, 100000))
             const revset = String(url.searchParams.get('revset') || '').trim() || 'all()'
             const want = limit > 0 ? limit + skip : 0
-            const args = ['log', '-r', revset, '--no-graph']
+            const args = ['log', '--revisions=' + revset, '--no-graph']
             if (want > 0) args.push('--limit', String(want))
             args.push('-T', LOG_TEMPLATE)
             const out = await runJj(repo, readArgs(args))
@@ -695,7 +806,21 @@ export function apply(ctx, config = {}) {
               return
             }
             const patch = await runJj(repo, ['diff', '--git', '-r', '@'])
-            const files = parseGitDiffFiles(patch)
+            const byPath = new Map(parseGitDiffFiles(patch).map((f) => [f.path, f]))
+            // Row set from jj itself; counts from the patch block for the same
+            // path. A file whose path cannot be matched (a display-only patch
+            // quirk) still gets a row instead of disappearing.
+            const files = (await diffFilesOf(repo, '@')).map((entry) => {
+              const p = byPath.get(entry.path)
+              return {
+                path: entry.path,
+                oldPath: entry.oldPath,
+                code: entry.code,
+                added: p ? p.added : 0,
+                deleted: p ? p.deleted : 0,
+                binary: p ? p.binary : false,
+              }
+            })
             const branch = wc.bookmarks[0] ?? '@'
             sendJson({
               ok: true,
@@ -724,12 +849,12 @@ export function apply(ctx, config = {}) {
               sendJson({ ok: false, error: 'path-outside-repo' }, 400)
               return
             }
-            const paths = [file]
+            const paths = [literalFile(file)]
             const old = url.searchParams.get('old')
-            if (old) paths.push(old)
+            if (old) paths.push(literalFile(old))
             const out = await runJj(repo, ['diff', '--git', '-r', '@', '--', ...paths]).catch(() => '')
             const truncated = out.length > MAX_DIFF_CHARS
-            sendJson({ ok: true, diff: truncated ? out.slice(0, MAX_DIFF_CHARS) : out, truncated })
+            sendJson({ ok: true, diff: truncateText(out, MAX_DIFF_CHARS), truncated })
             break
           }
 
@@ -745,11 +870,10 @@ export function apply(ctx, config = {}) {
               sendJson({ ok: false, error: 'path-outside-repo' }, 400)
               return
             }
-            const escaped = file.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
             const out = await runJj(
               repo,
-              readArgs(['log', '-r', `files("${escaped}")`, '--no-graph', '-T', LOG_TEMPLATE]),
-            ).catch(() => '')
+              readArgs(['log', '--revisions=' + `files(${literalFile(file)})`, '--no-graph', '-T', LOG_TEMPLATE]),
+            )
             sendJson({ ok: true, file, commits: toCommits(out, null) })
             break
           }
@@ -760,7 +884,7 @@ export function apply(ctx, config = {}) {
               sendJson({ ok: false, error: 'missing-hash' }, 400)
               return
             }
-            const out = await runJj(repo, readArgs(['log', '-r', hash, '--no-graph', '-T', SHOW_TEMPLATE]))
+            const out = await runJj(repo, readArgs(['log', '--revisions=' + hash, '--no-graph', '-T', SHOW_TEMPLATE]))
             const rows = parseRows(out)
             const row = rows[0]
             if (row === undefined) {
@@ -769,7 +893,7 @@ export function apply(ctx, config = {}) {
             }
             const [commitId, changeId, changeIdShort, parents, author, email, date, subject, description] = row
             const body = String(description).split('\n').slice(1).join('\n').trim()
-            const stat = await runJj(repo, readArgs(['diff', '--stat', '-r', hash])).catch(() => '')
+            const stat = await runJj(repo, readArgs(['diff', '--stat', '--revision=' + hash])).catch(() => '')
             sendJson({
               ok: true,
               hash: commitId,
@@ -792,9 +916,9 @@ export function apply(ctx, config = {}) {
               sendJson({ ok: false, error: 'missing-hash' }, 400)
               return
             }
-            const out = await runJj(repo, readArgs(['diff', '--git', '-r', hash])).catch(() => '')
+            const out = await runJj(repo, readArgs(['diff', '--git', '--revision=' + hash]))
             const truncated = out.length > MAX_DIFF_CHARS
-            sendJson({ ok: true, diff: truncated ? out.slice(0, MAX_DIFF_CHARS) : out, truncated })
+            sendJson({ ok: true, diff: truncateText(out, MAX_DIFF_CHARS), truncated })
             break
           }
 
@@ -805,9 +929,9 @@ export function apply(ctx, config = {}) {
               sendJson({ ok: false, error: 'missing-hash-or-file' }, 400)
               return
             }
-            const out = await runJj(repo, readArgs(['diff', '--git', '-r', hash, '--', file])).catch(() => '')
+            const out = await runJj(repo, readArgs(['diff', '--git', '--revision=' + hash, '--', literalFile(file)]))
             const truncated = out.length > MAX_DIFF_CHARS
-            sendJson({ ok: true, file, diff: truncated ? out.slice(0, MAX_DIFF_CHARS) : out, truncated })
+            sendJson({ ok: true, file, diff: truncateText(out, MAX_DIFF_CHARS), truncated })
             break
           }
 
@@ -827,6 +951,9 @@ export function apply(ctx, config = {}) {
             if (/^git@(.+):(.+)$/.test(raw)) web = raw.replace(/^git@([^:]+):(.*)$/, 'https://$1/$2')
             else if (/^ssh:\/\//.test(raw)) web = raw.replace(/^ssh:\/\/([^@]+@)?/, 'https://')
             web = web.replace(/\.git\/?$/, '').replace(/\/+$/, '')
+            // The page hands this to window.open; a remote URL with any other
+            // scheme (javascript:, file:, …) must never reach it.
+            if (!/^https?:\/\//i.test(web)) web = null
             sendJson({ ok: true, web, remote: raw })
             break
           }

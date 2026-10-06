@@ -15,7 +15,7 @@
  * Usage: node test/ops.test.mjs
  */
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -108,8 +108,10 @@ function buildScratchRepo() {
   writeFileSync(join(REPO, 'a.txt'), 'alpha\n')
   jj(REPO, ['describe', '-m', 'add a'])
   jj(REPO, ['new'])
-  // commit 2 + the one bookmark
+  // commit 2 + the one bookmark (tricky.txt commits here so the working-copy
+  // change to it is a modify whose hunk body starts with `---`/`+++`)
   writeFileSync(join(REPO, 'b.txt'), 'beta\n')
+  writeFileSync(join(REPO, 'tricky.txt'), '-- old\n')
   jj(REPO, ['describe', '-m', 'add b'])
   jj(REPO, ['bookmark', 'create', 'feature', '-r', '@'])
   jj(REPO, ['new'])
@@ -119,6 +121,13 @@ function buildScratchRepo() {
   jj(REPO, ['new'])
   // one uncommitted change in the working copy
   writeFileSync(join(REPO, 'd.txt'), 'delta\n')
+  // Shapes whose `jj diff --git` carries no `---`/`+++` line at all: a
+  // path-hunting parser drops these rows entirely.
+  writeFileSync(join(REPO, 'tricky.txt'), '++ new\n')   // hunk body lines start with ---/+++
+  chmodSync(join(REPO, 'a.txt'), 0o755)                  // mode-only change, no hunk
+  writeFileSync(join(REPO, 'bin.dat'), Buffer.from([0, 1, 2, 0, 255, 3])) // binary add
+  writeFileSync(join(REPO, 'empty.txt'), '')             // empty add
+  writeFileSync(join(REPO, 'glob:a'), '')                // a name that parses as a fileset pattern
 
   // fixtures for the error paths
   mkdirSync(NON_REPO, { recursive: true })
@@ -304,6 +313,97 @@ async function main() {
   await check('workfile: rejects a path escaping the repo (400)', () => {
     eq(workfileEscape.status, 400, 'status')
     eq(workfileEscape.json?.ok, false, `ok (body: ${bodyOf(workfileEscape)})`)
+  })
+
+  /* ---------- every changed-file shape survives (regression: rows were dropped) ---------- */
+
+  await check('workstatus: every changed file is listed, whatever its diff looks like', () => {
+    const files = workstatus.json?.unstaged ?? []
+    const byPath = new Map(files.map((f) => [f.path, f]))
+    const missing = ['a.txt', 'bin.dat', 'd.txt', 'empty.txt', 'glob:a', 'tricky.txt']
+      .filter((name) => !byPath.has(name))
+    eq(missing.length, 0, `missing rows: ${JSON.stringify(missing)} (got ${JSON.stringify(files.map((f) => f.path))})`)
+    // A mode-only change and a binary add carry no `---`/`+++` line at all.
+    eq(byPath.get('a.txt').code, 'M', 'mode-only change code')
+    eq(byPath.get('bin.dat').binary, true, 'binary flag on bin.dat')
+    eq(byPath.get('empty.txt').code, 'A', 'empty add code')
+    eq(byPath.get('glob:a').code, 'A', 'fileset-looking name code')
+    // `--- old` / `+++ new` inside the hunk are content, not metadata.
+    eq(byPath.get('tricky.txt').added, 1, 'tricky.txt added')
+    eq(byPath.get('tricky.txt').deleted, 1, 'tricky.txt deleted')
+    for (const f of files) eq(f.path !== '', true, `row without a path: ${JSON.stringify(f)}`)
+    return `${files.length} rows: ${files.map((f) => f.code + ' ' + f.path).join(', ')}`
+  })
+
+  await check('workstatus: an injection-looking revision is never counted as a file', () => {
+    const files = workstatus.json?.unstaged ?? []
+    eq(files.some((f) => String(f.path).startsWith('-')), false, 'a row path starts with "-"')
+    return 'no row path starts with "-"'
+  })
+
+  /* ---------- one literal file, not a fileset pattern ---------- */
+
+  const globFile = await api({ op: 'workfile', repo: scratch, file: 'glob:a' })
+  await check('workfile: a name that looks like a fileset pattern is read as one literal file', () => {
+    eq(globFile.status, 200, 'status')
+    eq(globFile.json?.ok, true, `ok (body: ${bodyOf(globFile)})`)
+    ok(String(globFile.json.diff).includes('glob:a'), `diff does not mention glob:a: ${bodyOf(globFile).slice(0, 160)}`)
+    return 'glob:a resolved literally'
+  })
+
+  const globHist = await api({ op: 'filelog', repo: scratch, file: 'glob:a' })
+  await check('filelog: the same literal-file rule applies to history', () => {
+    eq(globHist.status, 200, 'status')
+    eq(globHist.json?.ok, true, `ok (body: ${bodyOf(globHist)})`)
+    return 'filelog accepted the literal path'
+  })
+
+  /* ---------- HTTP input may not become a jj global option ---------- */
+
+  const canary = join(TMP, 'canary.toml')
+  writeFileSync(canary, 'audit-only-canary-7e31\n')
+  const injected = await api({ op: 'show', repo: scratch, hash: `--config-file=${canary}` })
+  await check('show: a revision that looks like a global option is rejected, and no outside file is read', () => {
+    eq(injected.json?.ok, false, `expected a rejected revision, got: ${bodyOf(injected).slice(0, 160)}`)
+    ok(!injected.body.includes('audit-only-canary-7e31'), 'the out-of-repo file content leaked into the reply')
+    return 'revset parse error, no config read'
+  })
+
+  /* ---------- a failed read is not an empty result ---------- */
+
+  const badRev = await api({ op: 'diff', repo: scratch, hash: 'DOES_NOT_EXIST' })
+  await check('diff: an unknown revision fails loudly instead of reporting an empty diff', () => {
+    eq(badRev.json?.ok, false, `ok (body: ${bodyOf(badRev)})`)
+    ok(badRev.status >= 400, `status=${badRev.status}`)
+    return `status ${badRev.status}: ${String(badRev.json?.error).slice(0, 60)}`
+  })
+
+  /* ---------- the picker keeps its root ---------- */
+
+  const rootListing = await api({ op: 'listdir', path: '/' })
+  await check("listdir: '/' is reported as the root, with no parent", () => {
+    eq(rootListing.json?.ok, true, `ok (body: ${bodyOf(rootListing)})`)
+    eq(rootListing.json?.path, '/', 'path')
+    eq(rootListing.json?.parent, null, 'parent')
+    return 'path="/", parent=null'
+  })
+
+  /* ---------- an unreadable workspace is "cannot tell", not "not a repo" ---------- */
+
+  const locked = join(TMP, 'locked-workspace')
+  mkdirSync(join(locked, '.jj'), { recursive: true })
+  const probeLocked = await (async () => {
+    chmodSync(locked, 0o000)
+    try {
+      return await api({ op: 'probe', ws: locked })
+    } finally {
+      chmodSync(locked, 0o755)
+    }
+  })()
+  await check('probe: an unreadable workspace reports ok:false, never a definite "not a jj repo"', () => {
+    eq(probeLocked.json?.ok, false, `ok (body: ${bodyOf(probeLocked)})`)
+    eq(probeLocked.json?.jj, undefined, 'jj must be absent, not false')
+    return String(probeLocked.json?.error)
   })
 
   /* ---------- graph ---------- */
