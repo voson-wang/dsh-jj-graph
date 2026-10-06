@@ -45,5 +45,8 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
+  },
+  "scripts": {
+    "test": "node test/ops.test.mjs"
   }
 }
