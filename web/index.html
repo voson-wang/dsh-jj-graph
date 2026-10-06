@@ -932,7 +932,6 @@ function loadStored(key, def) {
 function saveStored(key, val) {
   try { localStorage.setItem(key, JSON.stringify(val)); } catch { /* ignore */ }
 }
-let WD_SHOW = loadStored("jjg-wdshow", { staged: true, unstaged: true, untracked: true }); // group visibility toggles
 let WD_FOLDED = loadStored("jjg-wdfolded", false);      // whole panel collapsed
 const WD_GROUP_FOLDED = new Set(loadStored("jjg-wdgroupfolded", [])); // folded group keys
 const WD_SELECT = new Set(); // "groupKey\0path" of checkbox-selected rows
@@ -1987,7 +1986,12 @@ function renderWdGroups(body) {
     { key: "changes", title: "工作副本变更 (@)", items: ws.unstaged, staged: "0" }
   ];
   for (const g of groups) {
-    if (!WD_SHOW[g.key] || !g.items.length) continue;
+    // No group-visibility toggle here: the old git-era `WD_SHOW` map held
+    // {staged, unstaged, untracked} while the only jj group is `changes`, so
+    // gating on it always missed and silently rendered zero rows (count in the
+    // header, empty body). The whole panel folds as one; individual rows stay
+    // listed.
+    if (!g.items.length) continue;
     const wrap = document.createElement("div");
     wrap.className = "wd-group" + (WD_GROUP_FOLDED.has(g.key) ? " folded" : "");
     const gh = document.createElement("div");
@@ -2017,9 +2021,15 @@ function renderWdGroups(body) {
       row.appendChild(badge);
       const path = document.createElement("span");
       path.className = "wd-path";
-      path.textContent = it.path;
-      path.title = (it.oldPath ? it.oldPath + " → " : "") + it.path;
-      if (it.oldPath) {
+      // One visible name per row, and the "← old" suffix only for a real
+      // rename/copy: a deleted file arrives with an empty `path` (older host
+      // halves put the name in `oldPath` only), and a modified file used to
+      // repeat its own name as `oldPath`.
+      const shown = it.path || it.oldPath || "";
+      const moved = (it.code === "R" || it.code === "C") && it.oldPath && it.oldPath !== shown;
+      path.textContent = shown;
+      path.title = moved ? it.oldPath + " → " + shown : shown;
+      if (moved) {
         const old = document.createElement("span");
         old.className = "wd-old";
         old.textContent = "  ← " + it.oldPath;
@@ -2068,11 +2078,13 @@ function renderWdGroups(body) {
 
 /** Load one file's diff (or content for untracked) on demand; cached. */
 async function loadWdFile(item, staged, pre) {
-  const key = staged + "\u0000" + item.path;
+  // A deleted row can arrive with the name on `oldPath` only (older host half).
+  const file = item.path || item.oldPath || "";
+  const key = staged + "\u0000" + file;
   const cached = wdDiffCache.get(key);
   if (cached) { renderWdText(pre, cached.text, cached.isDiff); return; }
   try {
-    const res = await api("workfile", { file: item.path, staged, ...(item.oldPath ? { old: item.oldPath } : {}) });
+    const res = await api("workfile", { file, staged, ...(item.oldPath && item.oldPath !== file ? { old: item.oldPath } : {}) });
     let text = "";
     let isDiff = false;
     if (!res.ok) {

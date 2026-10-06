@@ -205,12 +205,21 @@ function parseGitDiffFiles(text) {
   const files = []
   let cur = null
   const push = () => {
-    if (cur !== null && (cur.path || cur.oldPath)) files.push(cur)
+    if (cur === null) return
+    // A deleted file only names itself on the `--- a/<path>` line: `+++` says
+    // /dev/null, so `minus` is the row's path and is not a rename source.
+    if (!cur.path && cur.minus) cur.path = cur.minus
+    if (cur.path || cur.oldPath) {
+      const { minus, ...row } = cur
+      files.push(row)
+    }
   }
   for (const line of text.split('\n')) {
     if (line.startsWith('diff --git ')) {
       push()
-      cur = { path: '', oldPath: '', code: 'M', added: 0, deleted: 0, binary: false }
+      // `minus` is the a/ side, remembered until `+++` says whether it is the
+      // file's own name (modify/delete) or `/dev/null` (addition).
+      cur = { path: '', oldPath: '', minus: '', code: 'M', added: 0, deleted: 0, binary: false }
       continue
     }
     if (cur === null) continue
@@ -228,10 +237,12 @@ function parseGitDiffFiles(text) {
       cur.path = line.slice('copy to '.length)
     } else if (line.startsWith('+++ ')) {
       const p = line.slice(4)
-      if (p !== '/dev/null' && !cur.path) cur.path = p.replace(/^b\//, '')
+      if (p === '/dev/null') {
+        if (!cur.path && cur.minus) cur.path = cur.minus
+      } else if (!cur.path) cur.path = p.replace(/^b\//, '')
     } else if (line.startsWith('--- ')) {
       const p = line.slice(4)
-      if (p !== '/dev/null' && !cur.path && !cur.oldPath) cur.oldPath = p.replace(/^a\//, '')
+      if (p !== '/dev/null' && !cur.minus) cur.minus = p.replace(/^a\//, '')
     } else if (line.startsWith('Binary files') || line.startsWith('GIT binary patch')) {
       cur.binary = true
     } else if (line.startsWith('+') && !line.startsWith('+++')) {

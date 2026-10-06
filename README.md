@@ -77,7 +77,8 @@ node test/ops.test.mjs
 # 带上 GIT_GRAPH_CLIENT 同时校验 git 插件时为 24 项）
 node test/client.test.mjs
 
-# 页面：DOM 复刻壳层 + 真实 handler，断言主题跟随 / 输入框隐藏 / 审批面板保留
+# 页面：DOM 复刻壳层 + 真实 handler，断言主题跟随 / 输入框隐藏 / 审批面板保留 /
+# 工作副本面板逐文件成行（A/M/D 三种形状，删除行也要显示文件名）
 node tools/verify-ui/serve.mjs --repo <一个 jj 仓库> --port 8981   # 然后开 http://127.0.0.1:8981/
 node tools/verify-ui/check.mjs --repo <一个 jj 仓库>               # 自动跑完全部场景
 ```
@@ -88,7 +89,12 @@ node tools/verify-ui/check.mjs --repo <一个 jj 仓库>               # 自动�
   jj 模板语言没有 `\x1f` 转义、也没有列表字面量（`[a, b]` 会语法错误），`json()` 会把值里的
   Tab/换行/引号转义掉，因此描述里出现任何字符都不会错列。
 - **没有暂存区**：jj 的工作副本本身就是一个 commit（`@`），所以面板只有一个分组；页面里
-  git 时代的暂存/批量操作代码整块删除，而不是留着等运行时报错。
+  git 时代的暂存/批量操作代码整块删除，而不是留着等运行时报错。同理，分组可见性也不再看
+  那张 git 时代的 `WD_SHOW`（键是 `staged`/`unstaged`/`untracked`，而 jj 的分组键是
+  `changes`）：v0.2.0 里它按 `changes` 查永远命中不到，于是计数照显示、文件行整组被跳过。
+- **删除行只有 `--- a/<path>` 这一个来源**：`+++` 是 `/dev/null`，所以解析器把 a/ 侧先记成
+  候选、由 `+++` 决定它是"文件本名"还是"重命名来源"；`oldPath` 只在 rename/copy 时非空，
+  修改不再把自己的名字重复一遍，删除行也不会渲染成空路径。
 - **书签 ≠ 分支**：`jj bookmark list --all-remotes` 还会列出 git 后端的合成远程 `git`，
   真远程另有其人——插件用 `jj git remote list` 的结果过滤，只保留真实远程。
 - **根提交**：jj 的 `root()`（全 0 commit id）不出现在图里，`total` 用 `(revset) ~ root()` 计数，

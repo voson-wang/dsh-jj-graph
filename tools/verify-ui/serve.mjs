@@ -83,8 +83,12 @@ function createScratchRepo(dir) {
   jj(dir, ['commit', '-m', 'feat: add util helpers'])
   jj(dir, ['bookmark', 'create', 'main', '-r', '@-'])
   // Live working-copy change: only op=workstatus snapshots it, reads never do.
+  // One add, one modify and one delete keep every row shape in the fixture: a
+  // deleted file names itself only on the `--- a/<path>` side of the diff, so a
+  // parser (or a row renderer) that ignores it shows a blank row.
   writeFileSync(join(dir, 'src', 'app.js'), 'export const app = 42\n')
   writeFileSync(join(dir, 'notes.txt'), 'scratch notes\n')
+  rmSync(join(dir, 'src', 'util.js'))
 }
 
 const args = parseArgs(process.argv.slice(2))

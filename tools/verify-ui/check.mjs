@@ -144,6 +144,42 @@ async function abEval(expr) {
 }
 const probe = () => abEval('__probe()')
 
+/**
+ * Working-copy panel state inside the JJ iframe: header count, group count and
+ * one entry per rendered file row (badge, visible path, rename arrow).
+ */
+const WD_ROWS_EXPR = `(function(){
+  var d = document.querySelector('.jj-graph-frame').contentDocument;
+  if (!d) return null;
+  var p = d.querySelector('#wdPanel');
+  if (!p) return null;
+  var rows = [];
+  var list = p.querySelectorAll('.wd-row');
+  for (var i = 0; i < list.length; i++) {
+    var r = list[i];
+    var b = r.querySelector('.wd-badge');
+    var q = r.querySelector('.wd-path');
+    rows.push({
+      badge: b ? b.textContent : '',
+      path: q ? q.textContent : '',
+      hasOld: !!r.querySelector('.wd-old')
+    });
+  }
+  var c = p.querySelector('.wd-counts');
+  return { countText: c ? c.textContent : '', groups: p.querySelectorAll('.wd-group').length, rows: rows, clean: !!p.querySelector('.wd-clean') };
+})()`
+
+async function waitForWdRows(want, label, timeout = 15000) {
+  const t0 = Date.now()
+  let last = null
+  while (Date.now() - t0 < timeout) {
+    last = await abEval(WD_ROWS_EXPR)
+    if (last && last.rows.length === want) return last
+    await sleep(250)
+  }
+  throw new Error(`timed out waiting for ${label}; last panel=${JSON.stringify(last)}`)
+}
+
 async function waitForProbe(cond, label, timeout = 15000) {
   const t0 = Date.now()
   let last = null
@@ -249,7 +285,12 @@ async function main() {
           const byPath = new Map(files.map((f) => [f.path, f]))
           if (!byPath.has('src/app.js') || byPath.get('src/app.js').code !== 'M') probs.push('scratch fixture src/app.js (modified) missing: ' + JSON.stringify(files.map((f) => f.path + ':' + f.code)))
           if (!byPath.has('notes.txt') || byPath.get('notes.txt').code !== 'A') probs.push('scratch fixture notes.txt (added) missing')
-          if (r.json.counts && r.json.counts.unstaged !== 2) probs.push(`counts.unstaged=${r.json.counts.unstaged} (scratch fixture expects 2)`)
+          // A deletion must carry its own path: `+++ /dev/null` cannot name it.
+          if (!byPath.has('src/util.js') || byPath.get('src/util.js').code !== 'D') probs.push('scratch fixture src/util.js (deleted) missing or unnamed: ' + JSON.stringify(files))
+          // Only a rename/copy may carry a distinct oldPath; a modify must not.
+          if (byPath.get('src/app.js') && byPath.get('src/app.js').oldPath) probs.push(`modified row carries oldPath=${JSON.stringify(byPath.get('src/app.js').oldPath)}`)
+          if (byPath.get('src/util.js') && byPath.get('src/util.js').oldPath) probs.push(`deleted row carries oldPath=${JSON.stringify(byPath.get('src/util.js').oldPath)}`)
+          if (r.json.counts && r.json.counts.unstaged !== 3) probs.push(`counts.unstaged=${r.json.counts.unstaged} (scratch fixture expects 3)`)
         }
         if (probs.length === 0) {
           const scope = server.repoGiven ? 'invariants only: --repo was supplied, no fixture written' : 'scratch fixture present'
@@ -287,6 +328,7 @@ async function main() {
       'browser: dark -> light switch is followed live via MutationObserver (no reload)',
       'browser: chat view -> composer input visible, seat has height',
       'browser: JJ view -> composer input hidden, fallback display:none, seat height 0',
+      'browser: working-copy panel lists every changed file (A/M/D), not just the count',
       'browser: JJ view + approval panel -> approval visible, composer still hidden',
       'browser: embedded-session workspace still renders the graph [expected-defect]',
     ]
@@ -404,6 +446,39 @@ async function main() {
         if (p.composerSeatHeight !== 0) probs.push('composer seat height=' + p.composerSeatHeight)
         assertAll(probs)
         return `input hidden via [data-conversation-content]:has(.jj-graph-view), fallback display=none, seat=0px`
+      })
+
+      await scenario('browser: working-copy panel lists every changed file (A/M/D), not just the count', async () => {
+        await ensureJjView()
+        const r = await httpJson(server.url, `jj-graph/api?op=workstatus&repo=${encodeURIComponent(server.repo)}`)
+        if (r.status !== 200 || !r.json || r.json.ok !== true) throw new Error(`workstatus ${r.status} ${r.text.slice(0, 160)}`)
+        const expected = r.json.unstaged || []
+        // The page polls workstatus on its own; click 刷新 so the panel is
+        // guaranteed to reflect the fixture at this point.
+        await abEval(`(function(){
+          var d = document.querySelector('.jj-graph-frame').contentDocument;
+          var b = d.querySelector('#wdPanel .wd-top button');
+          if (b) b.click();
+          return 1
+        })()`)
+        const panel = await waitForWdRows(expected.length, 'the panel to list every changed file')
+        const probs = []
+        if (panel.clean) probs.push('panel showed "no changes" while workstatus reported ' + expected.length + ' file(s)')
+        if (panel.countText !== `${expected.length} 个文件`) probs.push(`header says "${panel.countText}", workstatus says ${expected.length}`)
+        if (expected.length > 0 && panel.groups !== 1) probs.push(`groups=${panel.groups} (jj has exactly one change group)`)
+        for (const f of expected) {
+          // A deleted file carries its name only on `oldPath` in older host
+          // halves; the row must still show it instead of a blank path.
+          const name = f.path || f.oldPath
+          const hit = panel.rows.find((row) => row.path.trim() === name || row.path.trim().startsWith(name + ' '))
+          if (!hit) { probs.push(`no row for ${name}; rendered=${JSON.stringify(panel.rows.map((x) => x.path.trim()))}`); continue }
+          if (hit.badge !== f.code) probs.push(`row ${name} badge=${hit.badge} != ${f.code}`)
+          if ((f.code === 'R' || f.code === 'C') !== hit.hasOld) probs.push(`row ${name} rename arrow=${hit.hasOld} for code ${f.code}`)
+        }
+        assertAll(probs)
+        screenshot('04-workdir.png')
+        const shapes = panel.rows.map((x) => x.badge + ' ' + x.path.trim()).join(', ')
+        return `${panel.countText} -> ${panel.rows.length} rows (${shapes})`
       })
 
       await scenario('browser: JJ view + approval panel -> approval visible, composer still hidden', async () => {
