@@ -44,6 +44,12 @@ for (let i = 0; i < argv.length; i++) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex')
+/** Revisions of the files under test (other writers may edit them mid-run). */
+const revisions = () => ({
+  'web/index.html': sha256(readFileSync(PAGE_FILE)),
+  'index.js': sha256(readFileSync(HOST_FILE)),
+  'client.js': sha256(readFileSync(CLIENT_FILE)),
+})
 const results = []
 const info = []
 function record(name, status, detail = '') { results.push({ name, status, detail }) }
@@ -172,8 +178,9 @@ async function main() {
   if (!existsSync(PAGE_FILE)) throw new Error(`missing ${PAGE_FILE}`)
   const pageOnDisk = readFileSync(PAGE_FILE, 'utf8')
   const clientOnDisk = readFileSync(CLIENT_FILE, 'utf8')
-  const pageHashStart = sha256(pageOnDisk)
-  note(`web/index.html revision ${pageHashStart.slice(0, 12)} (${pageOnDisk.length} bytes), client.js ${sha256(clientOnDisk).slice(0, 12)}`)
+  const revStart = revisions()
+  note(`revisions under test: ${Object.entries(revStart).map(([f, h]) => `${f} ${h.slice(0, 12)}`).join(', ')}`)
+  note(`web/index.html is ${pageOnDisk.length} bytes`)
   if (!/const css = \[[\s\S]*?\]\.join\(""\)/.test(clientOnDisk)) {
     note('client.js no longer exposes a `const css = [...].join("")` array; shell.html CSS extraction will fail')
   }
@@ -438,9 +445,11 @@ async function main() {
     stopServer(server)
   }
 
-  const pageHashEnd = sha256(readFileSync(PAGE_FILE))
-  if (pageHashEnd !== pageHashStart) {
-    note(`WARNING: web/index.html changed while the harness was running (${pageHashStart.slice(0, 12)} -> ${pageHashEnd.slice(0, 12)}); results may mix revisions`)
+  const revEnd = revisions()
+  for (const [file, hash] of Object.entries(revEnd)) {
+    if (hash !== revStart[file]) {
+      note(`WARNING: ${file} changed while the harness was running (${revStart[file].slice(0, 12)} -> ${hash.slice(0, 12)}); results may mix revisions`)
+    }
   }
   report()
 }
