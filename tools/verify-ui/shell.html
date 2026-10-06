@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>dsh-jj-graph UI verification shell (DOM replica)</title>
+<style>
+  /* Minimal slice of the real shell layout that the plugin's CSS depends on. */
+  html, body { margin: 0; height: 100%; }
+  body { background: #fff; font: 13px/1.5 -apple-system, "Segoe UI", sans-serif; }
+  body[data-ds-dark-theme] { background: #151517; }
+  .shell { height: 100%; display: flex; flex-direction: column; }
+  [data-conversation-content] { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  [data-conversation-scroll] { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow-y: auto; }
+  [data-slot="conversation.session"] { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .viewArea { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .composerSeat { display: flex; flex-direction: column; flex: none; }
+  .composerBar { display: flex; padding: 10px; border-top: 1px solid #ccc; background: #f6f8fa; }
+  .composerBar input { flex: 1; padding: 7px 9px; border: 1px solid #bbb; border-radius: 6px; }
+  .approval { padding: 12px; border: 2px solid #f0883e; background: #fff7ed; }
+  .chatView { padding: 12px; }
+</style>
+<script>
+  /* Harness origin storage would otherwise let a previous run pin the page's theme. */
+  try {
+    for (const k of ['jjg-theme', 'gg2-theme', 'gg2-currepo']) localStorage.removeItem(k)
+  } catch { /* ignore */ }
+</script>
+</head>
+<body>
+  <div class="shell">
+    <div data-conversation-content data-conversation-region="chat" data-content-phase="active">
+      <div data-conversation-scroll>
+        <div data-slot="conversation.session">
+          <div class="viewArea" data-slot="conversation.view" id="viewArea"></div>
+        </div>
+        <div class="composerSeat" data-composer-seat data-conversation-region="composer">
+          <div data-chain-overlay-fallback="conversation.composer" style="display:contents">
+            <div data-slot="conversation.composer.bar">
+              <div class="composerBar"><input id="composerInput" placeholder="发消息或创建任务"></div>
+            </div>
+          </div>
+          <!-- the chain's elected overlay (approval / question) lives in the same seat,
+               OUTSIDE the fallback element, so the plugin CSS can hide only the input bar -->
+          <div id="elected" hidden></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+/* ------------------------------------------------------------------ *
+ * Replica of the shell DOM pieces dsh-jj-graph depends on.
+ *  - the plugin CSS is extracted verbatim from the real client.js
+ *  - the JJ view is mounted exactly like client.js renders it
+ *    (<div class="jj-graph-view"><iframe class="jj-graph-frame">)
+ * ------------------------------------------------------------------ */
+let pluginCss = '';
+let pluginCssError = null;
+
+const viewArea = document.getElementById('viewArea');
+const seat = document.querySelector('[data-composer-seat]');
+const elected = document.getElementById('elected');
+const SID = new URLSearchParams(location.search).get('sid') || '';
+let frameReady = false;
+
+const isVisible = (el) => el !== null && el.getClientRects().length > 0;
+const frameEl = () => document.querySelector('.jj-graph-frame');
+
+/* ThemePresenter.apply(): presence of the empty attribute means dark. */
+window.__setTheme = function setTheme(dark) {
+  if (dark) document.body.setAttribute('data-ds-dark-theme', '');
+  else document.body.removeAttribute('data-ds-dark-theme');
+  return document.body.hasAttribute('data-ds-dark-theme');
+};
+
+window.__setView = function setView(kind) {
+  frameReady = false;
+  viewArea.innerHTML = '';
+  if (kind !== 'jj') {
+    viewArea.innerHTML = '<div id="chatView" class="chatView">chat transcript</div>';
+    return 'chat';
+  }
+  const view = document.createElement('div');
+  view.className = 'jj-graph-view';
+  const frame = document.createElement('iframe');
+  frame.className = 'jj-graph-frame';
+  frame.title = 'JJ 图谱';
+  frame.addEventListener('load', () => { frameReady = true; });
+  frame.src = '/jj-graph/index.html' + (SID ? '?sid=' + encodeURIComponent(SID) : '');
+  view.appendChild(frame);
+  viewArea.appendChild(view);
+  return 'jj';
+};
+
+/* The chain's elected overlay. Deliberately does NOT touch the fallback's own
+   display: hiding the composer is the plugin CSS's job, and that is what we test. */
+window.__setApproval = function setApproval(on) {
+  elected.hidden = !on;
+  elected.innerHTML = on
+    ? '<div class="approval" data-approval-key="k1"><button>允许一次</button><button>拒绝</button></div>'
+    : '';
+  return !!on;
+};
+
+window.__probe = function probe() {
+  const frame = frameEl();
+  const doc = frame ? frame.contentDocument : null;
+  const win = frame ? frame.contentWindow : null;
+  const fallback = document.querySelector('[data-chain-overlay-fallback="conversation.composer"]');
+  const input = document.getElementById('composerInput');
+  const approval = document.querySelector('[data-approval-key]');
+  const ready = frameReady && !!doc && !!doc.body && doc.readyState !== 'loading';
+  let parentIsDark = null, rootClass = null, bodyBg = null, rows = null;
+  let emptyState = null, repoLabel = null, marker = null;
+  let loadingHidden = null, statsText = null, branchHeads = null, graphLoaded = false;
+  if (ready) {
+    rootClass = doc.documentElement.className;
+    bodyBg = getComputedStyle(doc.body).backgroundColor;
+    rows = doc.querySelectorAll('#commitList .cl-row').length;
+    branchHeads = doc.querySelectorAll('#commitList .cl-head').length;
+    const es = doc.getElementById('emptyState');
+    emptyState = es ? !es.classList.contains('hidden') : null;
+    const ld = doc.getElementById('loading');
+    loadingHidden = ld ? ld.classList.contains('hidden') : null;
+    const sb = doc.getElementById('statsBar');
+    statsText = sb ? sb.textContent.trim().replace(/\s+/g, ' ') : null;
+    const rl = doc.getElementById('repoLabel');
+    repoLabel = rl ? rl.textContent : null;
+    graphLoaded = emptyState === false && loadingHidden === true && !!repoLabel;
+    try { marker = win.__uiMarker === undefined ? null : win.__uiMarker; } catch { marker = null; }
+    try { parentIsDark = typeof win.parentIsDark === 'function' ? win.parentIsDark() : null; } catch { parentIsDark = null; }
+  }
+  return {
+    shellDarkAttribute: document.body.hasAttribute('data-ds-dark-theme'),
+    jjViewMounted: document.querySelector('.jj-graph-view') !== null,
+    composerInputExists: input !== null,
+    composerInputVisible: isVisible(input),
+    composerFallbackDisplay: fallback ? getComputedStyle(fallback).display : null,
+    composerSeatHeight: seat ? Math.round(seat.getBoundingClientRect().height) : -1,
+    approvalKeyPresent: approval !== null,
+    approvalVisible: isVisible(approval),
+    iframeReady: ready,
+    iframeGraphLoaded: graphLoaded,
+    iframeLoadingHidden: loadingHidden,
+    iframeStatsText: statsText,
+    iframeBranchHeads: branchHeads,
+    iframeParentIsDark: parentIsDark,
+    iframeRootClass: rootClass,
+    iframeBodyBg: bodyBg,
+    iframeCommitRows: rows,
+    iframeEmptyStateVisible: emptyState,
+    iframeRepoLabel: repoLabel,
+    iframeMarker: marker,
+    pluginCssLoaded: pluginCss.length > 0,
+    pluginCssError,
+    pluginCssHasComposerRule: /data-chain-overlay-fallback/.test(pluginCss),
+    sid: SID,
+  };
+};
+
+window.__setMarker = function setMarker(value) {
+  const frame = frameEl();
+  if (!frame || !frame.contentWindow) return null;
+  frame.contentWindow.__uiMarker = value;
+  return frame.contentWindow.__uiMarker;
+};
+
+/* Pull the plugin's style payload straight out of the shipped client.js. */
+(async () => {
+  try {
+    const src = await (await fetch('/__plugin-client.js', { cache: 'no-store' })).text();
+    const region = /const css = \[([\s\S]*?)\]\s*\.join\(""\)/.exec(src);
+    if (region === null) throw new Error('could not locate the css array in client.js');
+    const literals = region[1].match(/"((?:[^"\\]|\\.)*)"/g) || [];
+    pluginCss = literals.map((lit) => JSON.parse(lit)).join('');
+    if (pluginCss === '') throw new Error('the css array in client.js was empty');
+  } catch (err) {
+    pluginCssError = String((err && err.message) || err);
+  }
+  const tag = document.createElement('style');
+  tag.dataset.plugin = 'dsh-jj-graph';
+  tag.dataset.pluginCss = 'dsh-jj-graph/style';
+  tag.textContent = pluginCss;
+  document.head.appendChild(tag);
+  window.__harnessReady = true;
+})();
+
+window.__setTheme(false);
+window.__setView('chat');
+window.__setApproval(false);
+</script>
+</body>
+</html>
