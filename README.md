@@ -12,6 +12,7 @@
 
 | 区域 | 说明 |
 |---|---|
+| 智能显示 | **只在当前会话的工作区是 jj 仓库时才出现这个标签页**；colocated 仓库（`.jj` 与 `.git` 并存，你三个 jj 仓库都是）算 jj，里 sibling 的「Git 图谱」会自动让位。判断失败一律回退成"显示"，见下 |
 | 仓库发现 | 自动采用当前会话工作区（向上找 `.jj`）；顶栏「📂 打开」可浏览磁盘添加任意 jj 仓库；内存态允许列表在 dsh 重启后由页面重新注册 |
 | 变更图谱 | `jj log -r 'all()'`，自绘泳道图；`@`（工作副本）用绿色环标记；分页每次 200 条 |
 | 书签过滤 | 本地书签 / 远程书签分别成组，可折叠、可勾选过滤；`main@origin` 之类远程书签单独着色 |
@@ -20,6 +21,24 @@
 | 工作副本面板 | `@` 的全部改动（jj 没有暂存区，所以是**一个**分组），逐文件 +/− 计数，点击展开该文件的 diff |
 | 搜索 | 描述 / 作者 / 邮箱 / change id / commit id |
 | 主题 | 「自动」跟随 Harness 界面浅色/深色（读取 `body[data-ds-dark-theme]`，属性存在=深色），并随壳层实时切换；另有 8 套配色预设 |
+
+## 智能显示（标签页按会话工作区出现）
+
+`conversation.view` 的注册是**全局列表**：壳层 `viewTabs()` 遍历 `slots.entries()`，没有可见性谓词（唯一的内建过滤是硬编码的 `trajectory` + developerTools）。但 tab 条和它显示的会话都在 conversation header 里，所以在
+`conversation.session.header.utilities`（`list` / session 作用域，恰好与 tab 同时渲染）挂一个**不可见探针**上报当前会话 cwd，插件据此注册或注销自己的 view 条目：
+
+- Host 侧 `op=probe&ws=<cwd>`：只做 stat 向上探测，同时报告 `.jj` 与 `.git`，不起 jj 进程。
+- Client 侧规则：**jj 插件** 可见 ⟺ `jj === true`；**git 插件** 可见 ⟺ `git === true && jj !== true`（colocated 时 jj 优先）。
+- **任何信息缺失都保持可见**：无会话、无 cwd、probe 报错 / 超时 / 回复不合法 → 显示。也就是说这个特性最坏是"该藏的没藏掉"，**不会把 tab 弄丢**。
+- 跨会话切换：不同工作区的会话之间切换时，tab 会跟着出现/消失（这是它的设计意图）。若某个会话当前正停在已消失的 tab 上，壳层的 `resolveActiveView` 会兜底回「对话」，不会白屏。
+
+`test/client.test.mjs` 用桩容器把上面每条规则都钉住了（含乱序回复、网络失败、无 cwd、同一 cwd 去重）：
+
+```sh
+node test/client.test.mjs
+# 顺带校验打了同样补丁的 git 插件：
+GIT_GRAPH_CLIENT=~/.dsh/profiles/desktop/node_modules/dsh-git-graph/client.js node test/client.test.mjs
+```
 
 ## 只读保证
 
@@ -51,8 +70,12 @@
 ## 本地验证
 
 ```sh
-# Host 半：39 项断言，含只读保证（自建 scratch 仓库，不碰你的仓库）
+# Host 半：43 项断言，含只读保证与仓库类型探测（自建 scratch 仓库，不碰你的仓库）
 node test/ops.test.mjs
+
+# Client 半：12 项断言，钉住标签页的显示规则（桩容器，无需启动 Harness；
+# 带上 GIT_GRAPH_CLIENT 同时校验 git 插件时为 24 项）
+node test/client.test.mjs
 
 # 页面：DOM 复刻壳层 + 真实 handler，断言主题跟随 / 输入框隐藏 / 审批面板保留
 node tools/verify-ui/serve.mjs --repo <一个 jj 仓库> --port 8981   # 然后开 http://127.0.0.1:8981/
@@ -77,6 +100,7 @@ node tools/verify-ui/check.mjs --repo <一个 jj 仓库>               # 自动�
 
 - 只读：改历史、建书签、推送都要回终端用 `jj`。
 - 单仓库视图：一次只显示一个仓库（顶栏可切换）。
+- 智能显示只做到「按当前会话的工作区」：同一次会话里跨仓切换需要顶部「📂 打开」换仓库，tab 本身不跟着换。
 - 大仓库：`all()` 全量取；页面按 200 条分页，但 `total` 需要一次完整 revset 遍历（有 5 秒缓存）。
 - 不显示 jj 的 `divergent` / `hidden` 特殊状态，也不画 jj 自带的图（自绘泳道）。
 

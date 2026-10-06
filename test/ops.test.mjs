@@ -15,7 +15,8 @@
  * Usage: node test/ops.test.mjs
  */
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -210,6 +211,48 @@ async function main() {
     ok(Array.isArray(repos.json.repos), 'repos is not an array')
     ok(repos.json.repos.includes(scratch), `repos=${JSON.stringify(repos.json.repos)}`)
     eq(repos.json.wsIsJj, true, 'wsIsJj')
+  })
+
+  /* ---------- repo-kind probe (drives the Client tab's visibility) ---------- */
+
+  // The scratch repo came from `jj git init`, so it is colocated: `.jj` next to
+  // `.git`. The probe must report both, which is what lets the sibling git
+  // plugin stand down there.
+  const probeColocated = await api({ op: 'probe', ws: scratch })
+  await check('probe: colocated repo reports jj:true and git:true', () => {
+    eq(probeColocated.status, 200, 'status')
+    eq(probeColocated.json?.ok, true, `ok (body: ${bodyOf(probeColocated)})`)
+    eq(probeColocated.json.jj, true, 'jj')
+    eq(probeColocated.json.git, true, 'git')
+  })
+
+  // A directory that only has `.git` (no jj): the jj plugin must stay out of it.
+  const gitOnly = join(TMP, 'git-only')
+  mkdirSync(join(gitOnly, '.git'), { recursive: true })
+  const probeGit = await api({ op: 'probe', ws: gitOnly })
+  await check('probe: git-only directory reports jj:false and git:true', () => {
+    eq(probeGit.status, 200, 'status')
+    eq(probeGit.json?.ok, true, `ok (body: ${bodyOf(probeGit)})`)
+    eq(probeGit.json.jj, false, 'jj')
+    eq(probeGit.json.git, true, 'git')
+  })
+
+  // Outside any repository (created under the OS temp dir, so no ancestor is a
+  // repo either) both markers are false — the tab should not be advertised.
+  const outside = mkdtempSync(join(tmpdir(), 'jj-graph-probe-'))
+  const probeOutside = await api({ op: 'probe', ws: join(outside, 'nested', 'deeper') })
+  await check('probe: a directory outside any repo reports jj:false and git:false', () => {
+    eq(probeOutside.status, 200, 'status')
+    eq(probeOutside.json?.ok, true, `ok (body: ${bodyOf(probeOutside)})`)
+    eq(probeOutside.json.jj, false, 'jj')
+    eq(probeOutside.json.git, false, 'git')
+  })
+
+  const probeMissing = await api({ op: 'probe' })
+  await check("probe: missing ws -> 400 'missing-ws' (never a false negative)", () => {
+    eq(probeMissing.status, 400, 'status')
+    eq(probeMissing.json?.ok, false, 'ok')
+    eq(probeMissing.json?.error, 'missing-ws', 'error')
   })
 
   const find = await api({ op: 'findrepos', ws: scratch })

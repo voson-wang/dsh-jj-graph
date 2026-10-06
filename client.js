@@ -49,17 +49,108 @@ window.__ModuleLoader__.load({
 			});
 		}
 
+		//#region smart tab
+		/**
+		 * The tab exists only while the session on screen works on a jj
+		 * repository, so a workspace without one does not advertise a viewer that
+		 * could only apologise.
+		 *
+		 * A `conversation.view` entry is a global list entry — the shell has no
+		 * per-entry visibility predicate — but the tab strip and its session both
+		 * live in the conversation header. A silent probe entry in
+		 * `conversation.session.header.utilities` (a `list`/session slot, rendered
+		 * exactly when the tabs are) reports the shown session's cwd, and this
+		 * module re-registers or drops the view entry to match.
+		 *
+		 * A colocated repository counts as jj: jj owns `.jj` beside `.git`, and the
+		 * sibling git viewer is expected to stand down there.
+		 *
+		 * Fail-safe: missing information — no session, no cwd, probe error,
+		 * timeout, malformed reply — keeps the tab visible. The feature can fail
+		 * to hide a tab, never lose one.
+		 */
+		const PROBE_TIMEOUT_MS = 4000;
+		const VIEW_OPTIONS = { name: "conversation.view", id: "jj-graph", order: 21, label: () => "JJ 图谱" };
+		const PROBE_OPTIONS = { name: "conversation.session.header.utilities", id: "jj-graph-probe", order: 200 };
+
+		let pluginCtx = null;
+		let stopViewInject = null;
+		let lastCwd = null;
+		let probeSeq = 0;
+
+		/** Register or drop the view entry to match `visible`. Idempotent. */
+		function applyVisibility(visible) {
+			if (pluginCtx === null) return;
+			if (visible) {
+				if (stopViewInject !== null) return;
+				stopViewInject = pluginCtx.slots.inject("conversation.view", () => pluginCtx.slots.register(VIEW_OPTIONS, JjGraphView));
+				return;
+			}
+			if (stopViewInject === null) return;
+			const stop = stopViewInject;
+			stopViewInject = null;
+			stop();
+		}
+
+		/** Ask the Host what kind of repository `cwd` holds. */
+		function sync(cwd) {
+			if (typeof cwd !== "string" || cwd === "") {
+				// No workspace yet: never hide on missing information.
+				lastCwd = null;
+				applyVisibility(true);
+				return;
+			}
+			if (cwd === lastCwd) return;
+			lastCwd = cwd;
+			const seq = ++probeSeq;
+			const signal = typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+				? AbortSignal.timeout(PROBE_TIMEOUT_MS)
+				: undefined;
+			fetch("/jj-graph/api?op=probe&ws=" + encodeURIComponent(cwd), signal === undefined ? undefined : { signal })
+				.then((res) => res.json())
+				.then((reply) => {
+					if (seq !== probeSeq) return; // a newer session already answered
+					if (reply === null || typeof reply !== "object" || reply.ok !== true) {
+						applyVisibility(true);
+						return;
+					}
+					applyVisibility(reply.jj === true);
+				})
+				.catch(() => {
+					if (seq === probeSeq) applyVisibility(true);
+				});
+		}
+
+		/** Invisible entry whose only job is to publish the shown session's cwd. */
+		function RepoProbe(props) {
+			const sessionId = props.sessionId;
+			const useSessions = props.useSessions;
+			const cwd = typeof useSessions === "function"
+				? useSessions((snapshot) => {
+					if (sessionId === undefined || snapshot === undefined || snapshot.byId === undefined) return undefined;
+					const row = snapshot.byId[sessionId];
+					return row === undefined ? undefined : row.cwd;
+				})
+				: undefined;
+			react.useEffect(() => { sync(cwd); }, [cwd]);
+			return null;
+		}
+		//#endregion
+
 		/** Required service: the slot registry. */
 		const inject = ["slots"];
 
-		/** Client plugin body: the "JJ 图谱" conversation tab only. */
+		/** Client plugin body: the "JJ 图谱" conversation tab plus its visibility probe. */
 		function apply(ctx) {
-			ctx.slots.inject("conversation.view", () => ctx.slots.register({
-				name: "conversation.view",
-				id: "jj-graph",
-				order: 21,
-				label: () => "JJ 图谱"
-			}, JjGraphView));
+			pluginCtx = ctx;
+			// Visible until the probe says otherwise, so a slow or failed probe
+			// cannot pull the tab out from under the pointer.
+			applyVisibility(true);
+			ctx.slots.inject(PROBE_OPTIONS.name, () => ctx.slots.register(PROBE_OPTIONS, RepoProbe));
+			ctx.effect(() => () => {
+				pluginCtx = null;
+				stopViewInject = null;
+			}, "jj-graph: visibility state");
 		}
 
 		exports.apply = apply;

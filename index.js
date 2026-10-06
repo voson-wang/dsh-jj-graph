@@ -269,6 +269,22 @@ function findJjRoot(start) {
   return null
 }
 
+/** Walk up from `start` looking for a directory that holds a `.git` entry. */
+function findGitRoot(start) {
+  let dir = normalizePath(start) || '/'
+  for (let i = 0; i < 32; i++) {
+    try {
+      if (statSync(join(dir, '.git'))) return dir
+    } catch {
+      /* keep walking */
+    }
+    const parent = dirname(dir)
+    if (parent === dir) return null
+    dir = parent
+  }
+  return null
+}
+
 /* ===================== ops ===================== */
 
 /**
@@ -439,6 +455,35 @@ export function apply(ctx, config = {}) {
             }
           }
           sendJson({ ok: true, ws, repos: out })
+          return
+        }
+
+        if (op === 'probe') {
+          // Repo-kind probe for the Client half: it decides whether this
+          // plugin's conversation tab is worth showing for the session's
+          // workspace. Both markers are reported, so a colocated workspace
+          // (`.jj` beside `.git`) lets callers arbitrate between the git and jj
+          // plugins — jj owns a colocated repository, so a git-only viewer has
+          // nothing to add there.
+          //
+          // Cheap on purpose (two stat walks, no `jj` process): the client may
+          // call it on every session switch. `ok:false` means "cannot tell";
+          // callers must treat that as "keep showing the tab", never as "hide".
+          const ws = normalizePath(url.searchParams.get('ws') || '')
+          if (!ws) {
+            sendJson({ ok: false, error: 'missing-ws' }, 400)
+            return
+          }
+          const jjRoot = findJjRoot(ws)
+          const gitRoot = findGitRoot(ws)
+          sendJson({
+            ok: true,
+            ws,
+            jj: jjRoot !== null,
+            git: gitRoot !== null,
+            jjRoot,
+            gitRoot,
+          })
           return
         }
 
