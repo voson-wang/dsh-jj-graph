@@ -145,6 +145,44 @@ async function abEval(expr) {
 const probe = () => abEval('__probe()')
 
 /**
+ * The "which branch am I on" readout inside the JJ iframe: the header chip, the
+ * first legend entry and every branch-group badge. The page must never claim a
+ * branch without a matching badge (and vice versa) — that mismatch is exactly
+ * the bug that made `main` look checked out while `@` sat elsewhere.
+ */
+const POSITION_EXPR = `(function(){
+  var d = document.querySelector('.jj-graph-frame').contentDocument;
+  if (!d) return null;
+  var chip = d.querySelector('#posChip');
+  var badges = [];
+  var heads = d.querySelectorAll('#commitList .cl-head');
+  for (var i = 0; i < heads.length; i++) {
+    var b = heads[i].querySelector('.cl-head-badge');
+    var n = heads[i].querySelector('.cl-head-name');
+    if (b) badges.push({ name: n ? n.textContent : '', badge: b.textContent, cls: b.className });
+  }
+  var lg = d.querySelector('#legend .lg');
+  return {
+    chipHidden: chip ? chip.hidden : null,
+    chipText: chip ? chip.textContent : '',
+    chipTitle: chip ? chip.title : '',
+    badges: badges,
+    legendFirst: lg ? lg.textContent : ''
+  };
+})()`
+
+async function waitForPosition(timeout = 15000) {
+  const t0 = Date.now()
+  let last = null
+  while (Date.now() - t0 < timeout) {
+    last = await abEval(POSITION_EXPR)
+    if (last && last.chipHidden === false && last.chipText) return last
+    await sleep(200)
+  }
+  throw new Error(`timed out waiting for the position readout; last=${JSON.stringify(last)}`)
+}
+
+/**
  * Working-copy panel state inside the JJ iframe: header count, group count and
  * one entry per rendered file row (badge, visible path, rename arrow).
  */
@@ -333,6 +371,7 @@ async function main() {
     const avail = opts.browser ? browserAvailable() : { ok: false, why: '--no-browser' }
     const browserScenarios = [
       'browser: shell replica loads the real page, plugin CSS and the graph',
+      'browser: header names the current branch and the matching badge sits on it',
       'browser: light shell -> iframe follows (parentIsDark false, gg-light, white body)',
       'browser: dark shell -> iframe follows (parentIsDark true, no gg-light, #0d1117 body)',
       'browser: dark -> light switch is followed live via MutationObserver (no reload)',
@@ -381,6 +420,33 @@ async function main() {
         if (!(p.iframeCommitRows >= minRows)) probs.push(`commit rows=${p.iframeCommitRows} (<${minRows})`)
         assertAll(probs)
         return `${p.iframeCommitRows} commit rows in ${p.iframeBranchHeads} bookmark group(s), repo=${p.iframeRepoLabel}, stats="${p.iframeStatsText}"`
+      })
+
+      await scenario('browser: header names the current branch and the matching badge sits on it', async () => {
+        const pos = await waitForPosition()
+        const probs = []
+        if (pos.chipHidden !== false) probs.push('posChip is hidden')
+        if (!pos.chipText) probs.push('posChip has no text')
+        if (!pos.chipTitle) probs.push('posChip has no tooltip')
+        if (!/^(@ · |↑ 基于 )/.test(pos.chipText)) probs.push(`unexpected chip text: ${JSON.stringify(pos.chipText)}`)
+        if (!pos.legendFirst.startsWith(pos.chipText)) {
+          probs.push(`legend first item ${JSON.stringify(pos.legendFirst)} does not mirror the chip`)
+        }
+        if (pos.chipText === '@ · 无书签') {
+          if (pos.badges.length > 0) probs.push(`no-bookmark position but badge(s): ${JSON.stringify(pos.badges)}`)
+        } else if (pos.chipText.startsWith('↑ 基于 ')) {
+          const want = pos.chipText.slice('↑ 基于 '.length)
+          const base = pos.badges.filter((b) => b.badge === '基于')
+          if (base.length !== 1) probs.push(`expected exactly one 基于 badge, got ${JSON.stringify(pos.badges)}`)
+          else if (base[0].name !== want) probs.push(`基于 badge on ${JSON.stringify(base[0].name)} != ${JSON.stringify(want)}`)
+        } else {
+          const want = pos.chipText.slice('@ · '.length)
+          const at = pos.badges.filter((b) => b.badge === '@')
+          if (at.length !== 1) probs.push(`expected exactly one @ badge, got ${JSON.stringify(pos.badges)}`)
+          else if (at[0].name !== want) probs.push(`@ badge on ${JSON.stringify(at[0].name)} != ${JSON.stringify(want)}`)
+        }
+        assertAll(probs)
+        return `chip="${pos.chipText}", badges=${JSON.stringify(pos.badges)}`
       })
 
       await scenario('browser: light shell -> iframe follows (parentIsDark false, gg-light, white body)', async () => {

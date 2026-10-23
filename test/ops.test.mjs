@@ -24,6 +24,8 @@ const here = dirname(fileURLToPath(import.meta.url))
 const pluginRoot = resolve(here, '..')
 const TMP = join(here, '.tmp')
 const REPO = join(TMP, 'repo')
+// `.jj` next to `.git`: the only setup where git can name a checked-out branch.
+const COLOREPO = join(TMP, 'colocated')
 const NON_REPO = join(TMP, 'not-a-repo') // plain directory, no .jj anywhere above
 const FAKE_REPO = join(TMP, 'broken-jj') // contains `.jj` as a *file* -> jj rejects it
 
@@ -135,6 +137,30 @@ function buildScratchRepo() {
   writeFileSync(join(FAKE_REPO, '.jj'), '') // `.jj` is a file: jj refuses, the plugin's fs walk does not
 }
 
+/**
+ * Colocated fixture: `.jj` next to `.git`, with jj's `@` one empty commit above a
+ * bookmarked commit and git's HEAD attached to that bookmark. That is the shape
+ * a colocated worktree has after `jj new`, and the only setup in which "which
+ * branch is checked out" has a git answer at all.
+ */
+function buildColocatedRepo() {
+  const env = { ...process.env, ...JJ_ENV }
+  execFileSync('git', ['init', '--quiet', COLOREPO], { cwd: TMP, env, encoding: 'utf8' })
+  execFileSync(JJ_BIN, ['git', 'init', '--colocate'], { cwd: COLOREPO, env, encoding: 'utf8' })
+  jj(COLOREPO, ['config', 'set', '--repo', 'user.name', 'DSH Test'])
+  jj(COLOREPO, ['config', 'set', '--repo', 'user.email', 'dsh@example.com'])
+  writeFileSync(join(COLOREPO, 'a.txt'), 'alpha\n')
+  jj(COLOREPO, ['describe', '-m', 'colocated a'])
+  jj(COLOREPO, ['bookmark', 'create', 'main', '-r', '@'])
+  jj(COLOREPO, ['new'])
+  writeFileSync(join(COLOREPO, 'b.txt'), 'beta\n')
+  jj(COLOREPO, ['describe', '-m', 'colocated b'])
+  jj(COLOREPO, ['bookmark', 'create', 'topic', '-r', '@'])
+  jj(COLOREPO, ['new']) // @ is now an empty commit above `topic`
+  // Attach git's HEAD to the bookmark `@` sits on, like a checked-out worktree.
+  execFileSync('git', ['checkout', '--quiet', 'topic'], { cwd: COLOREPO, env, encoding: 'utf8' })
+}
+
 /* ===================== fake HTTP ===================== */
 
 function makeApi(handler) {
@@ -180,7 +206,9 @@ async function main() {
   if (jjVersion === null) return
 
   buildScratchRepo()
+  buildColocatedRepo()
   const scratch = realpathSync(REPO)
+  const colocated = realpathSync(COLOREPO)
 
   // Mount exactly the way the Host does.
   let handler = null
@@ -485,6 +513,40 @@ async function main() {
   await check("branches: jj's synthetic `git` remote produces no kind:'remote' row", () => {
     const remoteRows = (branches.json?.branches ?? []).filter((b) => b.kind === 'remote')
     eq(remoteRows.length, 0, `remote rows: ${JSON.stringify(remoteRows)}`)
+  })
+  // A plain `jj git init` repo has no `.git` at its root, so git cannot name a
+  // branch: the honest answer is the nearest upstream bookmark, reported as
+  // 'ancestor', never as a checked-out branch.
+  await check('branches: no git HEAD -> the nearest upstream bookmark is reported as ancestor', () => {
+    eq(branches.json?.position?.source, 'ancestor', 'position.source')
+    const names = branches.json?.position?.names ?? []
+    ok(names.includes('feature'), `position.names: ${JSON.stringify(names)}`)
+  })
+  await check('branches: no branch is faked as head when @ carries no bookmark', () => {
+    const rows = branches.json?.branches ?? []
+    const headRows = rows.filter((b) => b.head).map((b) => b.name)
+    eq(headRows.length, 0, `head rows: ${JSON.stringify(headRows)}`)
+    deepEq(rows.filter((b) => b.base).map((b) => b.name), ['feature'], 'base rows')
+  })
+
+  /* ---------- current branch in a colocated worktree ---------- */
+
+  await api({ op: 'addrepo', path: colocated })
+  const colo = await api({ op: 'branches', repo: colocated })
+  await check('branches: a colocated worktree reports the git checked-out branch', () => {
+    eq(colo.status, 200, 'status')
+    eq(colo.json?.ok, true, `ok (body: ${bodyOf(colo)})`)
+    eq(colo.json.position?.source, 'git-head', 'position.source')
+    eq(colo.json.position?.name, 'topic', 'position.name')
+  })
+  await check('branches: the trunk is no longer substituted for the real branch', () => {
+    const rows = colo.json?.branches ?? []
+    const topic = rows.find((b) => b.name === 'topic')
+    const main = rows.find((b) => b.name === 'main')
+    eq(topic?.head, true, 'topic head')
+    eq(topic?.headSource, 'git-head', 'topic headSource')
+    eq(main?.head, false, 'main must not be marked head')
+    eq(main?.base, false, 'main must not be marked base')
   })
 
   /* ---------- show / diff / filediff on the newest commit ---------- */

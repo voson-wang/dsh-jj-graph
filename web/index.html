@@ -380,6 +380,15 @@
     padding: 1px 6px; border-radius: 5px;
     background: var(--green); color: #04260f;
   }
+  /* An upstream bookmark ("@ is based on it"), not an exact match: muted, so it
+   * can never be mistaken for the @ badge. */
+  .cl-head .cl-head-badge.base { background: var(--bg4); color: var(--text2); }
+  header .pos-chip {
+    flex: none; font-size: 11.5px; padding: 1px 9px; border-radius: 999px;
+    border: 1px solid rgba(63,185,80,.35); color: var(--green);
+    background: rgba(63,185,80,.12); cursor: help; white-space: nowrap;
+  }
+  header .pos-chip.muted { border-color: var(--border); color: var(--text2); background: var(--bg3); }
   .cl-head .cl-head-count { font-size: 11.5px; color: var(--text3); flex: none; }
   .cl-head .cl-head-count.cl-synced { color: var(--green); }
   .cl-head .cl-head-tip {
@@ -805,6 +814,7 @@
 <header>
   <span class="title">JJ 图谱</span>
   <span class="repo" id="repoLabel" title=""></span>
+  <span class="pos-chip" id="posChip" hidden title=""></span>
   <select id="repoSwitch" title="切换仓库"></select>
   <span class="spacer"></span>
   <input id="searchBox" type="text" placeholder="搜索变更（描述/作者/change id）…">
@@ -920,7 +930,10 @@
 /* ===================== state ===================== */
 let REPO = null;
 let COMMITS = [];          // [{hash, parents[], author, email, date, subject, refs[]}]
-let BRANCHES = [];         // [{refname, kind, name, sha, head}]
+let BRANCHES = [];         // [{refname, kind, name, sha, head, headSource, base}]
+// Where the working copy actually sits, from the branches op:
+// {source: 'working-copy'|'git-head'|'ancestor'|null, names[], git, ancestor, ...}
+let POSITION = null;
 let WORKSTATUS = null;     // {branch, staged[], unstaged[], untracked[], counts}
 let wdDiffCache = new Map(); // workfile cache: "staged\0path" -> display text
 const WD_DIFF_CACHE_MAX = 24;
@@ -1191,9 +1204,77 @@ function normalizeBranch(b) {
       name: refname.replace(/^refs\/(heads|remotes|tags)\//, ""),
       sha: parts[1] || "",
       head: (parts[2] || "").trim() === "*",
+      headSource: null,
+      base: false,
     };
   }
   return b;
+}
+
+/* ===================== working-copy position ===================== */
+
+/**
+ * The "which branch am I on" readout. jj has no checked-out branch, so the
+ * host reports a graded answer (see the branches op) and this turns it into a
+ * label, a colour and a tooltip. `ancestor` is deliberately worded as "基于"
+ * (based on), never as "上了/检出" — the working copy sits on top of that
+ * bookmark, it is not pointing at it.
+ */
+function positionInfo() {
+  const p = POSITION;
+  if (!p) return null;
+  const names = Array.isArray(p.names) ? p.names.filter(Boolean) : [];
+  const name = names[0] || null;
+  const span = names.join(" / ");
+  if (p.source === "working-copy") {
+    return {
+      name, source: "working-copy", color: "#3fb950",
+      label: "@ · " + span,
+      title: "当前分支：" + span + "（书签就挂在工作副本 @ 上）",
+      sha: p.commitId || null,
+    };
+  }
+  if (p.source === "git-head") {
+    let title = "当前分支：" + span + "（git HEAD 检出的分支；@ 上没有书签）";
+    if (p.ancestor?.names?.length) title += "\n@ 的上游书签：" + p.ancestor.names.join(" / ");
+    return {
+      name, source: "git-head", color: "#3fb950",
+      label: "@ · " + span,
+      title,
+      sha: p.commitId || p.git?.commitId || null,
+    };
+  }
+  if (p.source === "ancestor") {
+    return {
+      name, source: "ancestor", color: "#8b949e",
+      label: "↑ 基于 " + span,
+      title: "工作副本 @ 上没有书签，上游也没有检出信息；" + span + " 是 @ 上游最近的书签（基于它，而不是检出它）",
+      sha: p.ancestor?.commitId || p.commitId || null,
+    };
+  }
+  return {
+    name: null, source: null, color: "#8b949e",
+    label: "@ · 无书签",
+    title: "工作副本 @ 上没有书签，上游也没有带书签的提交，无法判断当前分支",
+    sha: p.commitId || null,
+  };
+}
+
+/** Header chip: always-visible current-position readout next to the repo path. */
+function renderPosition() {
+  const chip = $("posChip");
+  if (!chip) return;
+  const pos = positionInfo();
+  if (!pos) {
+    chip.hidden = true;
+    chip.textContent = "";
+    chip.title = "";
+    return;
+  }
+  chip.hidden = false;
+  chip.textContent = pos.label;
+  chip.title = pos.title;
+  chip.classList.toggle("muted", pos.color !== "#3fb950");
 }
 
 /* ===================== layout ===================== */
@@ -1290,7 +1371,10 @@ function buildRows(vis) {
   const rows = []; // {type:'commit', hash} | {type:'head', refname, name, tip, count, head?}
   const seen = new Set();
   const map = byHash();
-  const headB = BRANCHES.find((b) => b.head) || BRANCHES.find((b) => b.kind === "local");
+  // Only a branch the Host actually marked head gets the @ badge: jj has no
+  // checked-out branch, so falling back to "the first local branch" would print
+  // a @ on a branch the working copy is not on (the bug this fixes).
+  const headB = BRANCHES.find((b) => b.head);
   // With an active branch filter, a branch whose tip is not visible must not
   // mark its commits as seen — otherwise a visible branch that shares those
   // commits (e.g. feature/x pointing at an ancestor of the hidden HEAD) would
@@ -1304,7 +1388,7 @@ function buildRows(vis) {
       cur = map.get(cur).parents[0] || null;
     }
     if (chain.length) {
-      rows.push({ type: "head", refname: headB.refname, name: headB.name, tip: chain[0], count: chain.length, head: true });
+      rows.push({ type: "head", refname: headB.refname, name: headB.name, tip: chain[0], count: chain.length, head: true, headSource: headB.headSource || null, base: false });
       if (!BRANCH_FOLDED.has(headB.refname)) {
         for (const h of chain) rows.push({ type: "commit", hash: h });
       }
@@ -1323,7 +1407,7 @@ function buildRows(vis) {
       cur = p;
     }
     if (!chain.length) continue;
-    rows.push({ type: "head", refname: b.refname, name: b.name, tip: chain[0], count: chain.length });
+    rows.push({ type: "head", refname: b.refname, name: b.name, tip: chain[0], count: chain.length, base: b.base === true });
     if (!BRANCH_FOLDED.has(b.refname)) {
       for (const h of chain) rows.push({ type: "commit", hash: h });
     }
@@ -1384,6 +1468,7 @@ function toggleBranchGroups() {
 
 function render() {
   BRANCH_COLOR_CACHE = null;
+  renderPosition();
   const map = byHash();
   const vis = visibleSet();
   const hlSet = HIGHLIGHT ? reachable(HIGHLIGHT) : null;
@@ -1565,6 +1650,15 @@ function buildHeadRow(r, vis, hlSet) {
     const badge = document.createElement("span");
     badge.className = "cl-head-badge";
     badge.textContent = "@";
+    badge.title = r.headSource === "git-head"
+      ? "当前分支：git HEAD 检出（@ 上没有书签）"
+      : "当前分支：书签就挂在工作副本 @ 上";
+    row.appendChild(badge);
+  } else if (r.base) {
+    const badge = document.createElement("span");
+    badge.className = "cl-head-badge base";
+    badge.textContent = "基于";
+    badge.title = "工作副本 @ 的上游最近书签（@ 本身没有书签）";
     row.appendChild(badge);
   }
   const count = document.createElement("span");
@@ -1625,8 +1719,13 @@ function renderLegend() {
   const lg = $("legend");
   lg.innerHTML = "";
   const items = [];
-  const headBranch = BRANCHES.find((b) => b.head) || BRANCHES.find((b) => b.kind === "local");
-  if (headBranch) items.push({ color: "#3fb950", label: "@ · " + headBranch.name, sha: headBranch.sha });
+  const pos = positionInfo();
+  if (pos) {
+    items.push(pos);
+  } else {
+    const headBranch = BRANCHES.find((b) => b.head) || BRANCHES.find((b) => b.kind === "local");
+    if (headBranch) items.push({ color: "#3fb950", label: "@ · " + headBranch.name, sha: headBranch.sha });
+  }
   const locals = BRANCHES.filter((b) => b.kind === "local" && !b.head);
   const remotes = BRANCHES.filter((b) => b.kind === "remote");
   const tags = BRANCHES.filter((b) => b.kind === "tag");
@@ -1638,12 +1737,14 @@ function renderLegend() {
     span.className = "lg" + (it.sha && HIGHLIGHT === it.sha ? " lg-on" : "");
     if (it.sha) {
       span.style.cursor = "pointer";
-      span.title = "点击高亮该书签路径";
+      span.title = it.title || "点击高亮该书签路径";
       span.addEventListener("click", (ev) => {
         ev.stopPropagation();
         HIGHLIGHT = HIGHLIGHT === it.sha ? null : it.sha;
         render();
       });
+    } else if (it.title) {
+      span.title = it.title;
     }
     const i = document.createElement("i");
     i.style.background = it.color;
@@ -2189,7 +2290,10 @@ async function reloadGraphLight() {
     ]);
     if (graph.ok) { COMMITS = graph.commits; TOTAL = graph.total || COMMITS.length; }
     LOADED = COMMITS.length;
-    if (branches.ok) BRANCHES = branches.branches.map(normalizeBranch);
+    if (branches.ok) {
+      BRANCHES = branches.branches.map(normalizeBranch);
+      POSITION = branches.position ?? null;
+    }
     BRANCH_COLOR_CACHE = null;
     fillFilterMenu();
     SELECTED = null;
@@ -2232,7 +2336,17 @@ function renderStatusLine() {
   el.innerHTML = "";
   const b = document.createElement("span");
   b.className = "branch";
-  b.textContent = "书签: " + (ws.branch || "?");
+  const pos = positionInfo();
+  if (pos && pos.name) {
+    b.textContent = "当前: " + (pos.source === "ancestor" ? "基于 " + pos.name : pos.name);
+    b.title = pos.title;
+  } else if (pos) {
+    b.textContent = "当前: @（无书签）";
+    b.title = pos.title;
+  } else {
+    // Position unknown (branches op unavailable): fall back to the wc bookmarks.
+    b.textContent = "书签: " + (ws.branch || "?");
+  }
   el.appendChild(b);
   const total = ws.counts.staged + ws.counts.unstaged + ws.counts.untracked;
   if (total > 0) {
@@ -2304,6 +2418,7 @@ function showEmpty(ws) {
   $("detail").classList.remove("open");
   COMMITS = [];
   BRANCHES = [];
+  POSITION = null;
   $("wdPanel").innerHTML = "";
   $("commitList").innerHTML = "";
   $("legend").innerHTML = "";
@@ -2392,6 +2507,7 @@ async function load() {
     TOTAL = graph.total || COMMITS.length;
     LOADED = COMMITS.length;
     BRANCHES = branches.ok ? branches.branches.map(normalizeBranch) : [];
+    POSITION = branches.ok ? (branches.position ?? null) : null;
     BRANCH_COLOR_CACHE = null;
     // 首次加载（尚无任何折叠偏好存储时）默认折叠全部分支组：
     // 只显示分组头，点击组头才展开该组提交；仅执行一次，之后尊重用户手动状态。
@@ -2626,7 +2742,7 @@ function fillFilterMenu() {
       dot.style.background = branchColorOf(b.sha);
       label.appendChild(cb);
       label.appendChild(dot);
-      label.appendChild(document.createTextNode(b.name + (b.head ? " (@)" : "")));
+      label.appendChild(document.createTextNode(b.name + (b.head ? " (@)" : b.base ? " (基于)" : "")));
       label.addEventListener("click", (ev) => ev.stopPropagation());
       cb.addEventListener("change", applyFilter);
       box.appendChild(label);

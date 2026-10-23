@@ -12,7 +12,7 @@
 // that intentionally see live working-copy state (`workstatus`, `workfile`)
 // let jj snapshot, exactly like `jj status` on the command line.
 import { execFile } from 'node:child_process'
-import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -95,6 +95,53 @@ function readArgs(args) {
   return [...args.slice(0, sep), '--ignore-working-copy', ...args.slice(sep)]
 }
 
+/**
+ * Run one read-only git command inside the worktree that contains `repo`.
+ * Never used for anything but reporting where git thinks it is.
+ * @returns stdout, or null when git is unavailable / the command fails.
+ */
+function runGit(repo, args) {
+  return new Promise((resolvePromise) => {
+    execFile(
+      'git',
+      ['-C', repo, ...args],
+      {
+        maxBuffer: 1024 * 1024,
+        windowsHide: true,
+        timeout: 10000,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat' },
+        cwd: repo,
+      },
+      (err, stdout) => resolvePromise(err ? null : stdout.toString()),
+    )
+  })
+}
+
+/**
+ * The branch git has checked out in the worktree that contains `repo`.
+ *
+ * Only colocated repos (`.git` next to `.jj`) have one: a plain `jj git init`
+ * repo keeps git's store inside `.jj/repo/store/git`. Even in a colocated repo
+ * git's HEAD is not always a branch — jj parks it on its own `refs/jj/root`
+ * scratch ref while the working copy has no bookmark, and a pure-jj workflow
+ * leaves it detached — so both of those report `branch: null` and the caller
+ * falls back to the bookmark on `@`'s ancestry.
+ * @returns {branch: string|null, commitId: string} | null
+ */
+async function gitHead(repo) {
+  try {
+    if (!existsSync(join(repo, '.git'))) return null
+  } catch {
+    return null
+  }
+  const commitId = (await runGit(repo, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']))?.trim()
+  if (!commitId) return null
+  const ref = (await runGit(repo, ['symbolic-ref', '--short', '--quiet', 'HEAD']))?.trim() ?? ''
+  // `jj/root` is jj's internal ref, not a branch a user can be "on".
+  const branch = ref !== '' && !ref.startsWith('jj/') ? ref : null
+  return { branch, commitId }
+}
+
 /** Resolve the jj workspace root for a path, or null when it is not a jj repo. */
 async function jjRoot(path) {
   try {
@@ -144,6 +191,64 @@ const SHOW_TEMPLATE = T([
 ])
 const BOOKMARK_TEMPLATE =
   T(['name', 'self.remote()', 'normal_target.commit_id()', 'if(normal_target, "1", "0")'])
+const ANCESTORS_TEMPLATE = T(['commit_id', 'bookmarks.map(|b| b.name())'])
+
+/**
+ * Commits that carry a local bookmark and are the closest such ancestors of `@`.
+ *
+ * jj has no checked-out branch — `@` is just a commit — so this is the honest
+ * answer to "which branch am I on" when `@` itself carries no bookmark: the
+ * branch the working copy sits on top of. `heads(::@ & bookmarks())` keeps only
+ * the newest such commits, and `@` is filtered out because a bookmark on `@` is
+ * reported as an exact match by the caller.
+ * @returns [{commitId, names}] newest first.
+ */
+async function bookmarkedAncestors(repo, wcCommitId) {
+  const out = await runJj(
+    repo,
+    readArgs(['log', '--revisions=heads(::@ & bookmarks())', '--no-graph', '-T', ANCESTORS_TEMPLATE]),
+  )
+  return parseRows(out)
+    .map(([commitId, names]) => ({ commitId, names: [...new Set((names ?? []).filter(Boolean))] }))
+    .filter((row) => row.names.length > 0 && row.commitId !== wcCommitId)
+}
+
+/**
+ * Where the working copy actually sits — the readout behind "which branch am I on".
+ *
+ * jj has no checked-out branch, so the answer is graded and the page labels it
+ * by `source`:
+ *   1. 'working-copy': a bookmark sits ON `@` (unambiguous; jj's own answer),
+ *   2. 'git-head':     a colocated git worktree has a branch checked out,
+ *   3. 'ancestor':     the nearest bookmarked ancestor of `@` — a "based on",
+ *                      not an "on",
+ *   4. null:           nothing to report (`@` and its ancestry carry no bookmark).
+ */
+function workingCopyPosition(wc, git, ancestors) {
+  const workingCopyBookmarks = [...new Set(wc?.bookmarks ?? [])]
+  let source = null
+  let names = []
+  if (workingCopyBookmarks.length) {
+    source = 'working-copy'
+    names = workingCopyBookmarks
+  } else if (git?.branch) {
+    source = 'git-head'
+    names = [git.branch]
+  } else if (ancestors.length) {
+    source = 'ancestor'
+    names = [...ancestors[0].names]
+  }
+  return {
+    commitId: wc?.commitId ?? null,
+    changeId: wc?.changeId ?? null,
+    source, // 'working-copy' | 'git-head' | 'ancestor' | null
+    name: names[0] ?? null,
+    names,
+    workingCopyBookmarks,
+    git: git ? { branch: git.branch ?? null, commitId: git.commitId } : null,
+    ancestor: ancestors[0] ? { commitId: ancestors[0].commitId, names: [...ancestors[0].names] } : null,
+  }
+}
 
 /**
  * One row per changed file of a revision (jj evaluates this per TreeDiffEntry):
@@ -783,16 +888,33 @@ export function apply(ctx, config = {}) {
                 kind,
                 name: displayName,
                 sha: target,
-                head: wc !== null && target === wc.commitId,
               })
             }
-            // Without a bookmark on `@`, mark the bookmark reachable from `@`
-            // when there is exactly one obvious candidate (trunk-like names).
-            if (!branches.some((b) => b.head)) {
-              const trunk = branches.find((b) => b.kind === 'local' && /^(main|master|trunk|default)$/.test(b.name))
-              if (trunk !== undefined) trunk.head = true
+            // jj has no checked-out branch, so "where am I" has to be reported,
+            // not guessed: `head` marks the bookmark that IS the working copy's
+            // position (a bookmark on `@`, or the branch a colocated git worktree
+            // has checked out), `base` marks the nearest upstream bookmark when
+            // `@` itself carries none. A trunk is never substituted for either —
+            // that made `main` look checked out while `@` sat on another branch.
+            const git = await gitHead(repo).catch(() => null)
+            const ancestors = await bookmarkedAncestors(repo, wc?.commitId).catch(() => [])
+            const position = workingCopyPosition(wc, git, ancestors)
+            for (const b of branches) {
+              b.head = false
+              b.headSource = null
+              b.base = false
+              if (b.kind !== 'local') continue
+              if (position.source === 'working-copy' && b.sha === position.commitId) {
+                b.head = true
+                b.headSource = 'working-copy'
+              } else if (position.source === 'git-head' && b.name === position.name) {
+                b.head = true
+                b.headSource = 'git-head'
+              } else if (position.source === 'ancestor' && position.names.includes(b.name)) {
+                b.base = true
+              }
             }
-            sendJson({ ok: true, branches })
+            sendJson({ ok: true, branches, position })
             break
           }
 
@@ -821,11 +943,16 @@ export function apply(ctx, config = {}) {
                 binary: p ? p.binary : false,
               }
             })
-            const branch = wc.bookmarks[0] ?? '@'
+            // Same graded answer as the `branches` op: a bookmark on `@`, then a
+            // colocated git worktree's checked-out branch, then plain `@`.
+            const git = await gitHead(repo).catch(() => null)
+            const branch = wc.bookmarks[0] ?? git?.branch ?? '@'
+            const branchSource = wc.bookmarks.length > 0 ? 'working-copy' : git?.branch ? 'git-head' : null
             sendJson({
               ok: true,
               repo,
               branch,
+              branchSource,
               changeId: wc.changeId,
               commitId: wc.commitId,
               description: wc.description,

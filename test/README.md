@@ -3,7 +3,9 @@
 `ops.test.mjs` mounts `index.js` on a fake `webServer`, drives `/jj-graph/api` with
 synthetic `req`/`res`, and checks every op's envelope + shape (`repos`, `findrepos`,
 `listdir`, `addrepo`, `graph` incl. root filtering, the `@` wc ref and `limit`/`skip`
-pagination, `branches`, `workstatus`, `workfile`, `show`, `diff`, `filediff`, `filelog`,
+pagination, `branches` incl. the current-position readout — bookmark on `@`, git HEAD in
+a colocated worktree, upstream bookmark otherwise, and never a trunk substitute —
+`workstatus`, `workfile`, `show`, `diff`, `filediff`, `filelog`,
 `remoteinfo`, the 400 paths) plus the read-only rule that pure reads append nothing to
 `jj op log`. `reveal` is never called; it opens Finder.
 

@@ -15,12 +15,31 @@
 | 智能显示 | **只在当前会话的工作区是 jj 仓库时才出现这个标签页**；colocated 仓库（`.jj` 与 `.git` 并存，你三个 jj 仓库都是）算 jj，里 sibling 的「Git 图谱」会自动让位。判断失败一律回退成"显示"，见下 |
 | 仓库发现 | 自动采用当前会话工作区（向上找 `.jj`）；顶栏「📂 打开」可浏览磁盘添加任意 jj 仓库；内存态允许列表在 dsh 重启后由页面重新注册 |
 | 变更图谱 | `jj log -r 'all()'`，自绘泳道图；`@`（工作副本）用绿色环标记；分页每次 200 条 |
+| 当前分支 | 顶栏徽章、图例首项、工作副本面板状态栏都给出「当前在哪」。真实位置用绿色 `@`（书签组头）标出，只有上游书签时用灰色「基于」，**不再拿 `main` 冒充**。判定规则见下 |
 | 书签过滤 | 本地书签 / 远程书签分别成组，可折叠、可勾选过滤；`main@origin` 之类远程书签单独着色 |
 | 变更详情 | 点击任一变更 → 元信息（**变更 ID** / 提交 ID / 作者 / 时间 / 父变更）、完整描述、`--stat`、完整 patch |
 | 单文件 diff | 详情面板里点文件 → 该变更中此文件的 diff；右键文件可看该文件的变更历史 |
 | 工作副本面板 | `@` 的全部改动（jj 没有暂存区，所以是**一个**分组），逐文件 +/− 计数，点击展开该文件的 diff |
 | 搜索 | 描述 / 作者 / 邮箱 / change id / commit id |
 | 主题 | 「自动」跟随 Harness 界面浅色/深色（读取 `body[data-ds-dark-theme]`，属性存在=深色），并随壳层实时切换；另有 8 套配色预设 |
+
+## 当前分支（`@` 到底在哪）
+
+jj 没有「检出分支」：`@` 就是一个提交，书签只是标签。所以「当前分支」不能像 git 那样读一个引用，
+插件按三级降级报告位置，并把来源写进 tooltip（`workingCopyPosition()`，`index.js`）：
+
+| 顺序 | 判定 | 页面表现 |
+|---|---|---|
+| 1 | 书签直接挂在 `@` 上（`jj bookmark set <名> -r @`） | 顶栏 `@ · <名>`（绿）＋该书签组头的绿色 `@` 徽章 |
+| 2 | colocated 仓库且 git 有符号引用的 HEAD 分支（仓库根有 `.git`，`git symbolic-ref --short HEAD` 可读；`refs/jj/root` 与 detached HEAD 都不算） | 同上，tooltip 标注「git HEAD 检出」 |
+| 3 | 以上都没有：`@` 上游最近的书签（revset `heads(::@ & bookmarks())`） | 顶栏 `↑ 基于 <名>`（灰）＋该书签组头的灰色「基于」徽章 |
+| — | 都没有 | `@ · 无书签`，不给任何书签挂徽章 |
+
+- **为什么不回退到 `main`**：v0.2.2 及以前在没有书签指向 `@` 时把 trunk 直接标成 `@`，于是 `@` 明明停在
+  `mini-program/kapinhui` 之上、页面却显示 `main` 是当前分支。现在宁可说「基于」，也不猜。
+- 纯 `jj git init` 仓库（`.git` 在 `.jj/repo/store/git` 里，仓库根没有 `.git`）没有 git HEAD，只会走到第 3 级。
+- `branches` op 一并返回 `position`（`source` / `names` / `git` / `ancestor`），每个书签行带 `head` / `headSource` / `base`；
+  工作副本面板状态栏读同一份判定（`workstatus` 的 `branch` / `branchSource`）。
 
 ## 智能显示（标签页按会话工作区出现）
 
@@ -45,6 +64,8 @@ GIT_GRAPH_CLIENT=~/.dsh/profiles/desktop/node_modules/dsh-git-graph/client.js no
 这个插件**不提供任何写操作**：没有 `jj describe` / `jj commit` / `jj abandon` / `jj git push` 的按钮，Host 半也**不注册任何会改仓库的 op**（`gitop` 之类一律 404）。
 
 纯读 op（`graph` / `branches` / `show` / `diff` / `filediff` / `filelog` / `remoteinfo`）都带 `--ignore-working-copy`，所以**打开页面不会快照工作副本、不会往 `jj op log` 里追加操作**。
+
+`branches` 为了判定当前分支，在仓库根存在 `.git` 时另读两条 git 命令（`git rev-parse --verify HEAD^{commit}`、`git symbolic-ref --short HEAD`）——只读引用，不写、不产生 op。
 
 只有 `workstatus` / `workfile`（必须反映工作副本当前状态）允许 jj 正常快照——和你在终端敲 `jj status` 的行为一致。
 
@@ -123,6 +144,9 @@ node tools/verify-ui/check.mjs --repo <一个 jj 仓库>               # 自动�
 - 智能显示只做到「按当前会话的工作区」：同一次会话里跨仓切换需要顶部「📂 打开」换仓库，tab 本身不跟着换。
 - 大仓库：`all()` 全量取；页面按 200 条分页，但 `total` 需要一次完整 revset 遍历（有 5 秒缓存）。
 - 不显示 jj 的 `divergent` / `hidden` 特殊状态，也不画 jj 自带的图（自绘泳道）。
+- **当前分支只能报到「上游最近书签」**：`@` 没有书签、又不在 colocated git HEAD 上时（例如纯 jj 仓库里
+  `jj new` 出一个空提交），jj 本身就没有更精确的事实来源，页面会显示 `↑ 基于 <书签>` 而不是假装精确。
+  想让它显示精确位置，工作时段用 `jj bookmark set <名> -r @` 把书签带到 `@` 上即可。
 
 ## 回滚
 
