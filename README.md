@@ -73,14 +73,22 @@ GIT_GRAPH_CLIENT=~/.dsh/profiles/desktop/node_modules/dsh-git-graph/client.js no
 
 ## 环境要求
 
-- `jj` ≥ 0.45（开发与测试基于 0.45.1）；`jj` 必须在 DSH 宿主进程的 `PATH` 上
-- DSH（DeepSeek Harness）桌面版；插件按 bundle 形态安装进 profile
+- `jj` ≥ 0.45（2026-10-29 起在 0.46.0 上验证：所有模板输出与 0.45.1 一致）；`jj` 必须在 DSH 宿主进程的 `PATH` 上
+- DSH（DeepSeek Harness）桌面版，`engines.dsh` 为 `>=0.1.0-rc.6 <0.3.0`；插件按 bundle 形态安装进 profile
 
 ## 安装
 
-插件是标准的 DSH bundle（`package.json` 声明 `dsh.bundle.patch`、`dsh.client`）。两种装法：
+插件是标准的 DSH bundle（`package.json` 声明 `dsh.bundle.patch`、`dsh.client`）。
 
-1. **创造模式的 Plugin Manager**（推荐）：
+从 npm 装进桌面版 profile：
+
+```sh
+dsh plugin --profile desktop add dsh-jj-graph
+```
+
+开发时从本仓库目录安装：
+
+1. **创造模式的 Plugin Manager**：
    ```js
    plugin_manager({ action: "install_bundle", target: "/绝对路径/refining/dsh-jj-graph" })
    ```
