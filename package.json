@@ -1,7 +1,6 @@
 {
   "name": "dsh-jj-graph",
   "version": "0.2.3",
-  "private": true,
   "description": "DSH plugin: read-only Jujutsu (jj) repository graph for the DeepSeek Harness Web GUI — change graph, bookmark filtering, per-change diffs, working-copy panel",
   "license": "MIT",
   "type": "module",
@@ -50,5 +49,10 @@
   },
   "scripts": {
     "test": "node test/ops.test.mjs && node test/client.test.mjs"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/voson-wang/dsh-jj-graph.git"
+  },
+  "homepage": "https://github.com/voson-wang/dsh-jj-graph#readme"
 }
